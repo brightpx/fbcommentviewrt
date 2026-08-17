@@ -118,6 +118,11 @@ class CommentDetector:
             try:
                 await self.refresh_comments()
                 await asyncio.sleep(refresh_interval)
+            except KeyboardInterrupt:
+                # User pressed Ctrl+C - stop monitoring
+                logger.info("Monitoring stopped by user")
+                self.stop_monitoring()
+                raise  # Re-raise to propagate to main()
             except Exception as e:
                 logger.error(f"Error in monitor loop: {e}")
                 await asyncio.sleep(refresh_interval)

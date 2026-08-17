@@ -21,8 +21,15 @@ class CommentDatabase:
         """Initialize database and create tables."""
         Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
         
-        self.conn = await aiosqlite.connect(self.db_path)
+        self.conn = await aiosqlite.connect(
+            self.db_path,
+            timeout=30.0  # Increase timeout to 30 seconds
+        )
         self.conn.row_factory = aiosqlite.Row
+        
+        # Enable WAL mode for better concurrent access
+        await self.conn.execute("PRAGMA journal_mode=WAL")
+        await self.conn.execute("PRAGMA busy_timeout=30000")  # 30 seconds in milliseconds
         
         # Read and execute schema
         schema_path = Path(__file__).parent / "schema.sql"

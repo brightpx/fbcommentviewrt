@@ -150,8 +150,11 @@ class FacebookCommentMonitor:
             await self.detector.monitor_loop(post_url)
             
         except KeyboardInterrupt:
+            # User pressed Ctrl+C - stop and cleanup
             logger.info("Monitoring interrupted by user")
-            self.renderer.show_info("Stopping monitoring...")
+            self.renderer.stop_live_display()
+            self.renderer.show_info("\n\nMonitoring stopped by user.")
+            raise  # Re-raise to exit cleanly
         except Exception as e:
             logger.error(f"Error during monitoring: {e}", exc_info=True)
             self.renderer.show_error(f"Monitoring error: {e}")
@@ -215,7 +218,8 @@ async def main():
         monitor = FacebookCommentMonitor()
         await monitor.run()
     except KeyboardInterrupt:
-        print("\n\nExiting...")
+        # User pressed Ctrl+C - exit cleanly without extra message
+        pass
     except Exception as e:
         print(f"\n\nFatal error: {e}")
         sys.exit(1)

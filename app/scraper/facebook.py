@@ -301,12 +301,32 @@ class FacebookScraper:
     
     async def close(self) -> None:
         """Close browser and cleanup."""
-        if self.page:
-            await self.page.close()
-        if self.context:
-            await self.context.close()
-        if self.browser:
-            await self.browser.close()
-        if self.playwright:
-            await self.playwright.stop()
-        logger.info("Browser closed")
+        try:
+            # Close with timeout to prevent hanging
+            if self.page:
+                try:
+                    await asyncio.wait_for(self.page.close(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Page close timed out")
+            
+            if self.context:
+                try:
+                    await asyncio.wait_for(self.context.close(), timeout=2.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Context close timed out")
+            
+            if self.browser:
+                try:
+                    await asyncio.wait_for(self.browser.close(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Browser close timed out")
+            
+            if self.playwright:
+                try:
+                    await asyncio.wait_for(self.playwright.stop(), timeout=3.0)
+                except asyncio.TimeoutError:
+                    logger.warning("Playwright stop timed out")
+            
+            logger.info("Browser closed")
+        except Exception as e:
+            logger.error(f"Error closing browser: {e}")
