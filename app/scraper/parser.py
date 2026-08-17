@@ -44,7 +44,7 @@ class FacebookParser:
             # Build a map of comments
             comment_map: Dict[str, Comment] = {}
             
-            for comment_link in comment_links:
+            for display_order, comment_link in enumerate(comment_links):
                 try:
                     # Extract comment ID from link
                     match = re.search(r'comment_id=(\d+)', comment_link.get('href', ''))
@@ -52,7 +52,7 @@ class FacebookParser:
                         continue
                     
                     comment_id = match.group(1)
-                    logger.debug(f"Processing comment ID: {comment_id}")
+                    logger.debug(f"Processing comment ID: {comment_id} (order: {display_order})")
                     
                     # Find the comment container (traverse up to find containing div)
                     container = self._find_comment_container(comment_link)
@@ -60,11 +60,11 @@ class FacebookParser:
                         logger.debug(f"No container found for comment {comment_id}")
                         continue
                     
-                    # Extract comment data
-                    comment_data = self._parse_comment_from_soup(container, comment_id, comment_link, now)
+                    # Extract comment data with display order
+                    comment_data = self._parse_comment_from_soup(container, comment_id, comment_link, now, display_order)
                     if comment_data:
                         comment_map[comment_id] = comment_data
-                        logger.info(f"Parsed comment {comment_id}: {comment_data.author} - {comment_data.message[:50]}")
+                        logger.info(f"Parsed comment {comment_id} (order {display_order}): {comment_data.author} - {comment_data.message[:50]}")
                     else:
                         logger.debug(f"Failed to parse comment data for {comment_id}")
                         
@@ -106,7 +106,7 @@ class FacebookParser:
         
         return None
     
-    def _parse_comment_from_soup(self, container, comment_id: str, time_link, now: datetime) -> Optional[Comment]:
+    def _parse_comment_from_soup(self, container, comment_id: str, time_link, now: datetime, display_order: int = 0) -> Optional[Comment]:
         """Parse comment data from BeautifulSoup element."""
         try:
             # Extract author - find link with /user/ that's not a status indicator
@@ -157,6 +157,7 @@ class FacebookParser:
                 message=message,
                 created_time=created_time,
                 last_seen=now,
+                display_order=display_order,
                 is_new=False,
                 children=[]
             )

@@ -15,6 +15,7 @@ class Comment:
     message: str
     created_time: datetime
     last_seen: datetime
+    display_order: int = 0  # Order on Facebook page (0 = most recent)
     is_new: bool = False
     is_deleted: bool = False
     children: List['Comment'] = field(default_factory=list)
@@ -29,6 +30,7 @@ class Comment:
             'message': self.message,
             'created_time': self.created_time.isoformat(),
             'last_seen': self.last_seen.isoformat(),
+            'display_order': self.display_order,
             'is_new': self.is_new,
             'is_deleted': self.is_deleted,
             'children': [child.to_dict() for child in self.children]
@@ -46,6 +48,7 @@ class Comment:
             message=data['message'],
             created_time=datetime.fromisoformat(data['created_time']),
             last_seen=datetime.fromisoformat(data['last_seen']),
+            display_order=data.get('display_order', 0),
             is_new=data.get('is_new', False),
             is_deleted=data.get('is_deleted', False),
             children=[]

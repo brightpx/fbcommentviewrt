@@ -7,7 +7,6 @@ from rich.panel import Panel
 from rich.tree import Tree
 from rich.table import Table
 from rich.layout import Layout
-from rich.live import Live
 from rich.text import Text
 from rich import box
 from ..models.comment import Comment, PostInfo
@@ -23,7 +22,6 @@ class CLIRenderer:
         self.config = config
         self.console = Console()
         self.display_config = config['display']
-        self.live: Optional[Live] = None
         self.post_info: Optional[PostInfo] = None
         self.comments: List[Comment] = []
         
@@ -57,18 +55,60 @@ class CLIRenderer:
             box=box.DOUBLE
         )
     
-    def create_comment_tree(self) -> Tree:
-        """Create comment tree view."""
-        tree = Tree("📝 Comments", style="bold white")
+    def create_comment_table(self) -> Table:
+        """Create comment table view (one row per comment)."""
+        display_limit = self.config.get('monitor', {}).get('display_limit', 50)
+        
+        if display_limit == 0:
+            title = f"📝 Comments (showing all {len(self.comments)})"
+            comments_to_show = self.comments
+        else:
+            actual_limit = min(display_limit, len(self.comments))
+            title = f"📝 Comments (showing last {actual_limit} of {len(self.comments)})"
+            comments_to_show = self.comments[-display_limit:] if len(self.comments) > display_limit else self.comments
+        
+        table = Table(title=title, box=box.ROUNDED, show_header=True, header_style="bold cyan")
+        table.add_column("Tier", width=6, style="dim")
+        table.add_column("Author", width=25)
+        table.add_column("Message", width=60)
+        table.add_column("Time", width=25)
         
         if not self.comments:
-            tree.add("[dim]No comments yet...[/dim]")
-            return tree
+            table.add_row("", "", "[dim]No comments yet...[/dim]", "")
+            return table
         
-        for comment in self.comments:
-            self._add_comment_to_tree(tree, comment)
+        for comment in comments_to_show:
+            self._add_comment_to_table(table, comment)
         
-        return tree
+        return table
+    
+    def _add_comment_to_table(self, table: Table, comment: Comment) -> None:
+        """Add comment to table (only tier 1 based on max_tier config)."""
+        max_tier = self.config.get('monitor', {}).get('max_tier', 999)
+        
+        # Only show comments within max_tier
+        if comment.tier > max_tier:
+            return
+        
+        color = self._get_tier_color(comment)
+        new_badge = " [bright_green bold]●[/bright_green bold]" if comment.is_new else ""
+        
+        # Format tier badge
+        tier_badge = f"[{color}]T{comment.tier}[/{color}]{new_badge}"
+        
+        # Format author
+        author = f"[bold {color}]{comment.author}[/bold {color}]"
+        
+        # Format message (truncate if too long)
+        max_length = 60
+        message = comment.message
+        if len(message) > max_length:
+            message = message[:max_length] + "..."
+        
+        # Format time
+        time_str = self._format_time(comment.created_time)
+        
+        table.add_row(tier_badge, author, message, time_str)
     
     def _add_comment_to_tree(self, parent_tree: Tree, comment: Comment) -> None:
         """Recursively add comment to tree."""
@@ -94,9 +134,15 @@ class CLIRenderer:
         
         node = parent_tree.add(comment_text)
         
-        # Add children
-        for child in comment.children:
-            self._add_comment_to_tree(node, child)
+        # Get max_tier from config
+        max_tier = self.config.get('monitor', {}).get('max_tier', 999)
+        
+        # Add children only if they don't exceed max_tier
+        # When max_tier=1, only show top-level comments (no children)
+        if max_tier > 1:
+            for child in comment.children:
+                if child.tier <= max_tier:
+                    self._add_comment_to_tree(node, child)
     
     def _get_tier_color(self, comment: Comment) -> str:
         """Get color for tier."""
@@ -143,7 +189,7 @@ class CLIRenderer:
         layout = Layout()
         layout.split_column(
             Layout(self.create_header(), size=10),
-            Layout(self.create_comment_tree())
+            Layout(self.create_comment_table())
         )
         return layout
     
@@ -152,26 +198,23 @@ class CLIRenderer:
         self.post_info = post_info
         self.comments = comments
         
-        if self.live:
-            self.live.update(self.create_layout())
+        # Clear screen and print (allows scrolling)
+        self.console.clear()
+        self.console.print(self.create_layout())
     
     def start_live_display(self, post_info: PostInfo, comments: List[Comment]) -> None:
         """Start live display."""
         self.post_info = post_info
         self.comments = comments
         
-        self.live = Live(
-            self.create_layout(),
-            console=self.console,
-            refresh_per_second=2,
-            screen=True
-        )
-        self.live.start()
+        # Initial display
+        self.console.clear()
+        self.console.print(self.create_layout())
     
     def stop_live_display(self) -> None:
         """Stop live display."""
-        if self.live:
-            self.live.stop()
+        # No-op since we're not using Live anymore
+        pass
     
     def show_notification_new_comment(self, comment: Comment) -> None:
         """Show notification for new comment."""

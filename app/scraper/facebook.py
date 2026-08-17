@@ -1,4 +1,5 @@
 """Facebook scraper using Playwright."""
+import asyncio
 import json
 import logging
 from pathlib import Path
@@ -120,6 +121,18 @@ class FacebookScraper:
             await self.page.goto(url, wait_until="domcontentloaded")
             await self.page.wait_for_timeout(3000)
             
+            # Scroll down to load comments
+            logger.info("Scrolling to load all comments...")
+            await self.page.evaluate("""
+                async () => {
+                    const scrollHeight = document.body.scrollHeight;
+                    window.scrollTo(0, scrollHeight);
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    window.scrollTo(0, 0);
+                }
+            """)
+            await self.page.wait_for_timeout(2000)
+            
             # Take screenshot after initial load
             await self._take_screenshot("01_after_navigation")
             
@@ -130,8 +143,28 @@ class FacebookScraper:
     
     async def switch_to_most_recent(self) -> bool:
         """Switch comment sorting to 'Most Recent' mode."""
+        return await self.switch_sorting_mode("most_recent")
+    
+    async def switch_sorting_mode(self, mode: str = "most_recent") -> bool:
+        """
+        Switch comment sorting mode.
+        
+        Args:
+            mode: Sorting mode - "most_recent" (ใหม่ล่าสุด), "most_relevant" (เกี่ยวข้องมากที่สุด), "all" (ทั้งหมด)
+        """
         try:
-            logger.info("Switching to 'Most Recent' comment view...")
+            mode_text_map = {
+                "most_recent": ["Most recent", "ใหม่ล่าสุด"],
+                "most_relevant": ["Most relevant", "เกี่ยวข้องมากที่สุด"],
+                "all": ["All comments", "ความคิดเห็นทั้งหมด"]
+            }
+            
+            if mode not in mode_text_map:
+                logger.warning(f"Unknown sorting mode: {mode}, defaulting to most_recent")
+                mode = "most_recent"
+            
+            target_texts = mode_text_map[mode]
+            logger.info(f"Switching to '{mode}' comment view...")
             
             # Look for sorting dropdown - try multiple selectors
             sorting_selectors = [
@@ -165,35 +198,35 @@ class FacebookScraper:
             await self.page.wait_for_timeout(1000)
             await self._take_screenshot("03_sorting_menu_opened")
             
-            # Click "Most recent" or "ใหม่ล่าสุด" option
-            recent_selectors = [
-                'div[role="menuitem"]:has-text("Most recent")',
-                'div[role="menuitem"]:has-text("ใหม่ล่าสุด")',
-                'div[role="menuitemradio"]:has-text("Most recent")',
-                'div[role="menuitemradio"]:has-text("ใหม่ล่าสุด")',
-            ]
+            # Click target sorting option
+            option_selectors = []
+            for text in target_texts:
+                option_selectors.extend([
+                    f'div[role="menuitem"]:has-text("{text}")',
+                    f'div[role="menuitemradio"]:has-text("{text}")',
+                ])
             
-            recent_option = None
-            for selector in recent_selectors:
+            target_option = None
+            for selector in option_selectors:
                 try:
-                    recent_option = await self.page.query_selector(selector)
-                    if recent_option:
-                        logger.info(f"Found 'Most recent' option with selector: {selector}")
+                    target_option = await self.page.query_selector(selector)
+                    if target_option:
+                        logger.info(f"Found '{mode}' option with selector: {selector}")
                         break
                 except:
                     continue
             
-            if not recent_option:
-                logger.warning("Could not find 'Most recent' option in menu")
-                await self._take_screenshot("04_no_recent_option")
+            if not target_option:
+                logger.warning(f"Could not find '{mode}' option in menu")
+                await self._take_screenshot("04_no_option")
                 return False
             
-            # Click "Most recent"
-            await recent_option.click()
+            # Click the sorting option
+            await target_option.click()
             await self.page.wait_for_timeout(2000)
-            await self._take_screenshot("05_switched_to_recent")
+            await self._take_screenshot(f"05_switched_to_{mode}")
             
-            logger.info("Successfully switched to 'Most Recent' view")
+            logger.info(f"Successfully switched to '{mode}' view")
             return True
             
         except Exception as e:

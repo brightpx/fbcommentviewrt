@@ -42,8 +42,14 @@ class CommentDetector:
             if not await self.scraper.navigate_to_post(post_url):
                 return False
             
-            # Switch to "Most Recent" view to see latest comments
-            await self.scraper.switch_to_most_recent()
+            # Get sorting mode from config
+            sorting_mode = self.config.get('monitor', {}).get('sorting_mode', 'most_recent')
+            
+            # Switch to configured sorting view
+            if sorting_mode == "most_recent":
+                await self.scraper.switch_to_most_recent()
+            else:
+                await self.scraper.switch_sorting_mode(sorting_mode)
             
             # Get post info
             self.post_info = await self.database.get_post_info(post_url)

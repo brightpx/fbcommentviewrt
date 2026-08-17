@@ -51,10 +51,11 @@ class CommentDatabase:
         await self.conn.execute(
             """
             INSERT INTO comments 
-            (id, parent_id, tier, author, message, created_time, last_seen, is_deleted, post_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, parent_id, tier, author, message, created_time, last_seen, display_order, is_deleted, post_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 last_seen = excluded.last_seen,
+                display_order = excluded.display_order,
                 is_deleted = excluded.is_deleted
             """,
             (
@@ -65,6 +66,7 @@ class CommentDatabase:
                 comment.message,
                 comment.created_time,
                 comment.last_seen,
+                comment.display_order,
                 comment.is_deleted,
                 post_url
             )
@@ -82,6 +84,7 @@ class CommentDatabase:
                 comment.message,
                 comment.created_time,
                 comment.last_seen,
+                comment.display_order,
                 comment.is_deleted,
                 post_url
             )
@@ -91,10 +94,11 @@ class CommentDatabase:
         await self.conn.executemany(
             """
             INSERT INTO comments 
-            (id, parent_id, tier, author, message, created_time, last_seen, is_deleted, post_url)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, parent_id, tier, author, message, created_time, last_seen, display_order, is_deleted, post_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET
                 last_seen = excluded.last_seen,
+                display_order = excluded.display_order,
                 is_deleted = excluded.is_deleted
             """,
             data
@@ -106,10 +110,10 @@ class CommentDatabase:
         """Get all comments for a post."""
         cursor = await self.conn.execute(
             """
-            SELECT id, parent_id, tier, author, message, created_time, last_seen, is_deleted
+            SELECT id, parent_id, tier, author, message, created_time, last_seen, display_order, is_deleted
             FROM comments
             WHERE post_url = ? AND is_deleted = 0
-            ORDER BY created_time ASC
+            ORDER BY display_order ASC
             """,
             (post_url,)
         )
@@ -126,6 +130,7 @@ class CommentDatabase:
                 message=row['message'],
                 created_time=datetime.fromisoformat(row['created_time']),
                 last_seen=datetime.fromisoformat(row['last_seen']),
+                display_order=row['display_order'],
                 is_deleted=bool(row['is_deleted']),
                 children=[]
             )

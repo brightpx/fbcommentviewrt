@@ -22,6 +22,9 @@ monitor:
   refresh_interval: 0.5  # seconds
   max_comments: 10000
   enable_notifications: true
+  sorting_mode: "most_recent"  # Options: "most_recent" (ใหม่ล่าสุด), "most_relevant" (เกี่ยวข้องมากที่สุด), "all" (ทั้งหมด)
+  display_limit: 50  # จำนวน comment ที่แสดงในหน้าจอ (0 = แสดงทั้งหมด)
+  max_tier: 3  # แสดง comments ถึง tier ไหน (1 = เฉพาะ comments หลัก, 2 = รวม replies ชั้นแรก, 3+ = รวม nested replies)
   
 # Database settings
 database:

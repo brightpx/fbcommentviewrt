@@ -30,6 +30,22 @@ def setup_logging(config: dict) -> None:
     )
 
 
+def cleanup_screenshots() -> None:
+    """Delete all .png files in screenshots directory."""
+    screenshots_dir = Path("screenshots")
+    if screenshots_dir.exists():
+        png_files = list(screenshots_dir.glob("*.png"))
+        if png_files:
+            logger = logging.getLogger(__name__)
+            logger.info(f"Cleaning up {len(png_files)} screenshot files...")
+            for png_file in png_files:
+                try:
+                    png_file.unlink()
+                except Exception as e:
+                    logger.warning(f"Failed to delete {png_file}: {e}")
+            logger.info("Screenshot cleanup completed")
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -66,6 +82,9 @@ class FacebookCommentMonitor:
         """Initialize all components."""
         try:
             logger.info("Initializing Facebook Comment Monitor...")
+            
+            # Clean up old screenshots
+            cleanup_screenshots()
             
             # Initialize renderer
             self.renderer = CLIRenderer(self.config)
