@@ -1,0 +1,50 @@
+# Facebook Comment Monitor Configuration
+
+# Target post URL
+target:
+  post_url: "https://www.facebook.com/groups/YOUR_GROUP_ID/posts/YOUR_POST_ID/"
+  # Example: https://www.facebook.com/groups/123456789/posts/987654321/
+
+# Browser settings
+browser:
+  headless: false  # Set to true for production
+  timeout: 30000   # milliseconds
+  slow_mo: 100     # milliseconds between actions
+
+# Session settings
+session:
+  file: "session/fb_session.json"
+  auto_save: true
+  check_interval: 300  # seconds
+
+# Monitor settings
+monitor:
+  refresh_interval: 0.5  # seconds
+  max_comments: 10000
+  enable_notifications: true
+  
+# Database settings
+database:
+  path: "database/comments.db"
+  auto_backup: true
+  backup_interval: 3600  # seconds
+
+# Display settings
+display:
+  tree_indent: "   "
+  show_relative_time: true
+  max_message_length: 200
+  colors:
+    tier1: "green"
+    tier2: "cyan"
+    tier3: "yellow"
+    tier4plus: "red"
+    new_comment: "bright_green"
+    new_reply: "bright_cyan"
+
+# Logging
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  file: "logs/app.log"
+  max_size: 10485760  # 10MB
+  backup_count: 5
