@@ -111,11 +111,21 @@ class CommentDetector:
                     logger.info("Using fast page refresh")
                     await self.scraper.refresh_page()
             
-            # Expand all comments
+            # ALWAYS expand comments to catch new hidden comments (regardless of first_refresh)
+            logger.info("Expanding all comments to detect new ones...")
             await self.scraper.expand_all_comments(max_tier=self.max_tier)
+            
+            # Force scroll to ensure Facebook loads all comments (especially new ones)
+            await self.scraper.page.evaluate("window.scrollTo(0, 0)")
+            await self.scraper.page.wait_for_timeout(500)
+            await self.scraper.page.evaluate("window.scrollBy(0, 300)")
+            await self.scraper.page.wait_for_timeout(500)
             
             # Parse comments
             comments = await self.parser.parse_comments()
+            logger.info(f"[DEBUG] Parser returned {len(comments)} comments")
+            for i, comment in enumerate(comments[:10]):  # Show first 10
+                logger.info(f"[DEBUG] Comment {i+1}: {comment.message[:50]}... (tier={comment.tier})")
             
             # Detect changes
             new_comments, updated_comments = self.cache.update(comments)
@@ -162,25 +172,13 @@ class CommentDetector:
         refresh_interval_ms = self.config['monitor']['refresh_interval']
         refresh_interval = refresh_interval_ms / 1000.0
         
-        # Start background refresh task
-        refresh_task = None
-        last_refresh_time = 0
-        
         while self.is_running:
             try:
-                current_time = asyncio.get_event_loop().time()
+                # Refresh comments and update display
+                await self.refresh_comments()
                 
-                # Start new refresh task if enough time has passed and no task is running
-                if (refresh_task is None or refresh_task.done()) and (current_time - last_refresh_time) >= refresh_interval:
-                    refresh_task = asyncio.create_task(self.refresh_comments())
-                    last_refresh_time = current_time
-                
-                # Update CLI every 1 second regardless of refresh status
-                if self.on_refresh:
-                    comments = await self.database.get_comments(self.post_info.url, limit=self.display_limit)
-                    await self.on_refresh(comments, self.post_info)
-                
-                await asyncio.sleep(1.0)  # Fixed 1 second CLI update
+                # Sleep for the configured interval before next refresh
+                await asyncio.sleep(refresh_interval)
                 
             except KeyboardInterrupt:
                 # User pressed Ctrl+C - stop monitoring

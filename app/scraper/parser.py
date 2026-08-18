@@ -19,21 +19,19 @@ class FacebookParser:
         self.max_tier = max_tier
         self.max_comments = max_comments
         self.post_url = post_url
+        self._container_cache: Dict[int, Any] = {}  # Cache container lookups by element id
     
     async def parse_comments(self) -> List[Comment]:
         """Parse all comments from the current page."""
         try:
             now = datetime.now()
+            
+            # Clear cache for new parse
+            self._container_cache.clear()
 
             # Get page content
             content = await self.page.content()
             soup = BeautifulSoup(content, 'html.parser')
-
-            # Debug: Save full page HTML
-            from pathlib import Path
-            debug_file = Path("debug_full_page.html")
-            debug_file.write_text(content, encoding='utf-8')
-            logger.info(f"Saved full page HTML to {debug_file}")
 
             # Each comment timestamp link has:
             #   - Top-level:  ?comment_id=XXX
@@ -48,7 +46,7 @@ class FacebookParser:
                 post_id = post_id_match.group(1)
                 # Filter comment links that have proper post path structure
                 # Must match: /posts/{post_id}/?comment_id= or permalink/{post_id}?comment_id=
-                post_path_pattern = f'/posts/{post_id}/\\?comment_id='
+                post_path_pattern = f'(/posts/{post_id}/|permalink/{post_id})\\?comment_id='
                 comment_links = [
                     link for link in all_comment_links 
                     if re.search(post_path_pattern, link.get('href', ''))
@@ -58,6 +56,41 @@ class FacebookParser:
                 comment_links = all_comment_links
                 logger.warning(f"Could not extract post ID from URL: {self.post_url}")
 
+            # FALLBACK: Find comment containers without links by searching for role="article" divs
+            # This catches newly posted comments that Facebook hasn't rendered links for yet
+            all_articles = soup.find_all('div', attrs={'role': 'article'})
+            logger.info(f"Found {len(all_articles)} article containers (potential comments without links)")
+            
+            # Build a set of comment IDs we already have from links
+            linked_comment_ids = set()
+            for link in comment_links:
+                href = link.get('href', '')
+                if match := re.search(r'comment_id=(\d+)', href):
+                    linked_comment_ids.add(match.group(1))
+            
+            # Try to extract comment IDs from articles that don't have links yet
+            unlisted_containers = []
+            for article in all_articles:
+                # Look for comment_id in any nested links within this article
+                nested_links = article.find_all('a', href=lambda x: x and 'comment_id=' in x)
+                if not nested_links:
+                    # No comment links in this article - might be a fresh comment
+                    unlisted_containers.append(article)
+                    continue
+                    
+                # Check if this article has comment IDs we don't already know about
+                for nested_link in nested_links:
+                    href = nested_link.get('href', '')
+                    if match := re.search(r'comment_id=(\d+)', href):
+                        cid = match.group(1)
+                        if cid not in linked_comment_ids:
+                            # Found a comment ID in article that wasn't in our main link list
+                            comment_links.append(nested_link)
+                            linked_comment_ids.add(cid)
+            
+            if unlisted_containers:
+                logger.info(f"Found {len(unlisted_containers)} article containers without comment links (likely fresh comments)")
+            
             comment_map: Dict[str, Comment] = {}
             display_order = 0
             t1_count = 0
@@ -83,18 +116,21 @@ class FacebookParser:
                         parent_id = None
                         tier = 1
                     else:
+                        logger.debug(f"[SKIP] No comment_id found in href: {href[:100]}")
                         continue
 
                     # Skip comments beyond max_tier
                     if tier > self.max_tier:
+                        logger.debug(f"[SKIP] Comment {comment_id} tier={tier} > max_tier={self.max_tier}")
                         continue
 
                     if comment_id in comment_map:
+                        logger.debug(f"[SKIP] Comment {comment_id} already parsed (duplicate)")
                         continue  # already parsed
 
                     container = self._find_comment_container(comment_link)
                     if not container:
-                        logger.debug(f"No container found for comment {comment_id}")
+                        logger.warning(f"No container found for comment {comment_id} (tier={tier}, href={href[:100]})")
                         continue
 
                     comment_data = self._parse_comment_from_soup(
@@ -109,6 +145,8 @@ class FacebookParser:
                             f"Parsed T{tier} {comment_id} (parent={parent_id}): "
                             f"{comment_data.author} - {comment_data.message[:50]}"
                         )
+                    else:
+                        logger.warning(f"[SKIP] _parse_comment_from_soup returned None for comment {comment_id}")
 
                 except Exception as e:
                     logger.debug(f"Failed to parse comment: {e}")
@@ -137,6 +175,11 @@ class FacebookParser:
         depth = 0
         
         while current and depth < max_depth:
+            # Check cache first
+            element_id = id(current)
+            if element_id in self._container_cache:
+                cached_result = self._container_cache[element_id]
+                return cached_result if cached_result is not False else None
             if current.name == 'div':
                 # Check if this container has both author and message
                 author_links = current.find_all('a', href=lambda x: x and '/user/' in x)
@@ -163,11 +206,16 @@ class FacebookParser:
                         
                         # Accept only if this container has exactly ONE comment ID
                         if len(unique_comment_ids) == 1:
+                            # Cache this successful result
+                            self._container_cache[element_id] = current
                             return current
                         
             current = current.parent
             depth += 1
         
+        # Cache negative result (not found)
+        if element.parent:
+            self._container_cache[id(element.parent)] = False
         return None
     
     def _parse_comment_from_soup(

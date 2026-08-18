@@ -3,6 +3,7 @@ import asyncio
 import logging
 import sys
 import yaml
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -11,6 +12,12 @@ from .database.db import CommentDatabase
 from .monitor.detector import CommentDetector
 from .renderer.cli import CLIRenderer
 from .models.comment import Comment
+
+try:
+    import msvcrt  # Windows only
+    HAS_MSVCRT = True
+except ImportError:
+    HAS_MSVCRT = False
 
 
 # Configure logging
@@ -59,6 +66,8 @@ class FacebookCommentMonitor:
         self.database: Optional[CommentDatabase] = None
         self.detector: Optional[CommentDetector] = None
         self.renderer: Optional[CLIRenderer] = None
+        self.post_comment_requested = False
+        self.keyboard_listener_running = False
         
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from YAML file."""
@@ -181,6 +190,125 @@ class FacebookCommentMonitor:
             self.renderer.update_display(post_info, comments)
             logger.info("renderer.update_display completed")
     
+    def _keyboard_listener_thread(self) -> None:
+        """Thread function to listen for keyboard input (Windows only)."""
+        if not HAS_MSVCRT:
+            return
+        
+        self.keyboard_listener_running = True
+        print("\n[DEBUG] Keyboard listener thread started")
+        logger.info("Keyboard listener started - press 'p' to post comment")
+        
+        while self.keyboard_listener_running:
+            if msvcrt.kbhit():
+                key = msvcrt.getch()
+                print(f"\n[DEBUG] Key pressed: {key}")
+                if key == b'p' or key == b'P':
+                    print("\n[DEBUG] P key detected! Setting flag...")
+                    logger.info("Post comment key pressed")
+                    self.post_comment_requested = True
+            
+            # Small sleep to avoid busy-waiting
+            import time
+            time.sleep(0.1)
+    
+    async def _check_and_post_comment(self) -> None:
+        """Check if comment post is requested and post it."""
+        if not self.post_comment_requested:
+            return
+        
+        from datetime import datetime
+        log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        print(f"\n[DEBUG] Flag detected! post_comment_requested={self.post_comment_requested}")
+        print(f"[DEBUG] Starting comment post process...")
+        logger.info(f"[{log_time}] Manual comment post requested (hotkey 'p' pressed)")
+        self.post_comment_requested = False
+        
+        try:
+            print(f"[DEBUG] Inside try block...")
+            auto_comment_config = self.config.get('auto_comment', {})
+            message = auto_comment_config.get('message', 'TEST_COMMENT_{{timestamp}}')
+            
+            print(f"[DEBUG] Message template: {message}")
+            
+            # Replace {{timestamp}} with actual timestamp
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%H%M%S")
+            message = message.replace('{{timestamp}}', timestamp)
+            
+            print(f"[DEBUG] Final message: {message}")
+            print(f"[DEBUG] Calling show_info...")
+            self.renderer.show_info(f"Posting comment: {message}")
+            print(f"[DEBUG] Calling post_comment...")
+            success = await self.scraper.post_comment(message)
+            print(f"[DEBUG] Post result: {success}")
+            
+            log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            if success:
+                logger.info(f"[{log_time}] Manual comment posted successfully")
+                logger.info(f"[{log_time}] Posted message: {message}")
+                self.renderer.show_success(f"Comment posted: {message}")
+                self.renderer.show_info("Waiting for comment to appear...")
+                await asyncio.sleep(5)
+                # Force refresh to show new comment immediately
+                comments = await self.detector.refresh_comments()
+                # Update display with new comments
+                self.renderer.start_live_display(self.detector.post_info, comments)
+                self.renderer.show_success("New comment displayed!")
+                await asyncio.sleep(5)  # Give user time to see the new comment before next refresh cycle
+            else:
+                logger.error(f"[{log_time}] ✗ Failed to post manual comment")
+                logger.error(f"[{log_time}] Failed message: {message}")
+                self.renderer.show_error("Failed to post comment")
+                
+        except Exception as e:
+            from datetime import datetime
+            log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logger.error(f"[{log_time}] Error posting comment: {e}", exc_info=True)
+            self.renderer.show_error(f"Comment error: {e}")
+    
+    async def post_new_comment(self, message: str) -> bool:
+        """Post a new comment to Facebook (public API)
+        
+        Args:
+            message: Comment message to post
+            
+        Returns:
+            bool: True if successful, False otherwise
+        """
+        try:
+            from datetime import datetime
+            log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            self.renderer.show_info(f"Posting comment: {message}")
+            logger.info(f"[{log_time}] Posting comment: {message}")
+            
+            success = await self.scraper.post_comment(message)
+            
+            if success:
+                logger.info(f"[{log_time}] Comment posted successfully: {message}")
+                self.renderer.show_success(f"Comment posted: {message}")
+                self.renderer.show_info("Waiting 5 seconds for comment to appear...")
+                await asyncio.sleep(5)
+                # Force refresh to show new comment immediately
+                await self.detector.refresh_comments()
+                # Give user time to see the new comment before next refresh cycle
+                self.renderer.show_success("New comment displayed! Resuming normal refresh cycle...")
+                await asyncio.sleep(3)
+                return True
+            else:
+                logger.error(f"[{log_time}] ✗ Failed to post comment: {message}")
+                self.renderer.show_error("Failed to post comment")
+                return False
+                
+        except Exception as e:
+            from datetime import datetime
+            log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logger.error(f"[{log_time}] ✗ Error posting comment: {e}", exc_info=True)
+            self.renderer.show_error(f"Comment error: {e}")
+            return False
+    
     async def start_monitoring(self, post_url: str) -> None:
         """Start monitoring a post."""
         try:
@@ -191,18 +319,46 @@ class FacebookCommentMonitor:
                 self.renderer.show_error("Failed to start monitoring")
                 return
             
+            # Start keyboard listener thread (Windows only)
+            if HAS_MSVCRT:
+                keyboard_thread = threading.Thread(target=self._keyboard_listener_thread, daemon=True)
+                keyboard_thread.start()
+                self.renderer.show_info("Press 'p' anytime to post a test comment")
+            
             # Initial refresh
             comments = await self.detector.refresh_comments()
             
             # Start live display
             self.renderer.start_live_display(self.detector.post_info, comments)
             
-            # Start monitoring loop
-            await self.detector.monitor_loop(post_url)
+            # Start monitoring loop with hotkey support
+            refresh_interval_ms = self.config['monitor']['refresh_interval']
+            refresh_interval = refresh_interval_ms / 1000.0
+            
+            while self.detector.is_running:
+                try:
+                    # Check if user pressed 'p' to post comment
+                    await self._check_and_post_comment()
+                    
+                    # Refresh comments and update display
+                    await self.detector.refresh_comments()
+                    
+                    # Sleep for the configured interval before next refresh
+                    await asyncio.sleep(refresh_interval)
+                    
+                except KeyboardInterrupt:
+                    # User pressed Ctrl+C - stop monitoring
+                    logger.info("Monitoring stopped by user")
+                    self.detector.stop_monitoring()
+                    raise  # Re-raise to propagate to main()
+                except Exception as e:
+                    logger.error(f"Error in monitor loop: {e}")
+                    await asyncio.sleep(1.0)
             
         except KeyboardInterrupt:
             # User pressed Ctrl+C - stop and cleanup
             logger.info("Monitoring interrupted by user")
+            self.keyboard_listener_running = False
             self.renderer.stop_live_display()
             self.renderer.show_info("\n\nMonitoring stopped by user.")
             raise  # Re-raise to exit cleanly
@@ -210,6 +366,7 @@ class FacebookCommentMonitor:
             logger.error(f"Error during monitoring: {e}", exc_info=True)
             self.renderer.show_error(f"Monitoring error: {e}")
         finally:
+            self.keyboard_listener_running = False
             self.renderer.stop_live_display()
     
     async def cleanup(self) -> None:

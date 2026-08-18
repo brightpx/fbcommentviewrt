@@ -49,6 +49,18 @@ class FacebookScraper:
             viewport={'width': 1920, 'height': 1080},
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
+        
+        # Block images to save bandwidth and improve performance
+        async def block_images(route):
+            if route.request.resource_type == "image":
+                logger.debug(f"Blocking image: {route.request.url[:100]}")
+                await route.abort()
+            else:
+                await route.continue_()
+        
+        await self.context.route("**/*", block_images)
+        logger.info("Image blocking enabled for all images")
+        
         self.page = await self.context.new_page()
         self.page.set_default_timeout(self.config['browser']['timeout'])
     
@@ -62,6 +74,18 @@ class FacebookScraper:
             viewport={'width': 1920, 'height': 1080},
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
+        
+        # Block images to save bandwidth and improve performance
+        async def block_images(route):
+            if route.request.resource_type == "image":
+                logger.debug(f"Blocking image: {route.request.url[:100]}")
+                await route.abort()
+            else:
+                await route.continue_()
+        
+        await self.context.route("**/*", block_images)
+        logger.info("Image blocking enabled for all images")
+        
         self.page = await self.context.new_page()
         self.page.set_default_timeout(self.config['browser']['timeout'])
     
@@ -308,37 +332,55 @@ class FacebookScraper:
     async def expand_all_comments(self, max_tier: int = 999) -> None:
         """Expand all comments and replies."""
         try:
-            # Click "View more comments" buttons
-            while True:
+            # Scroll down to load more comments first
+            await self.page.evaluate("window.scrollBy(0, 500)")
+            await self.page.wait_for_timeout(300)
+            
+            # Click "View more comments" buttons - limit attempts to avoid hanging
+            max_attempts = 3
+            attempts = 0
+            total_clicked = 0
+            while attempts < max_attempts:
                 try:
                     more_buttons = await self.page.query_selector_all(
                         'div[role="button"]:has-text("View more comments"), '
                         'div[role="button"]:has-text("ดูความคิดเห็นเพิ่มเติม")'
                     )
+                    logger.info(f"Found {len(more_buttons)} 'View more comments' buttons")
+                    
                     if not more_buttons:
                         break
                     
-                    for button in more_buttons[:5]:  # Process in batches
+                    clicked = False
+                    for button in more_buttons[:3]:  # Smaller batches for speed
                         try:
                             await button.scroll_into_view_if_needed()
-                            await button.click()
-                            await self.page.wait_for_timeout(500)
-                        except:
-                            pass
+                            await button.click(force=True, timeout=5000)  # Force click with 5s timeout
+                            await self.page.wait_for_timeout(100)  # Reduced from 500ms
+                            clicked = True
+                            total_clicked += 1
+                        except Exception as e:
+                            logger.warning(f"Failed to click 'View more comments' button: {e}")
                     
-                    if len(more_buttons) < 5:
+                    attempts += 1
+                    
+                    if not clicked:
                         break
                         
-                except Exception:
+                except Exception as e:
+                    logger.warning(f"Error finding more buttons: {e}")
                     break
+            
+            logger.info(f"Clicked {total_clicked} 'View more comments' buttons in {attempts} attempts")
             
             # Skip expanding replies if max_tier is 1 (main comments only)
             if max_tier < 2:
                 logger.info(f"Skipping reply expansion (max_tier={max_tier})")
                 return
             
-            # Click "View more replies" buttons
-            while True:
+            # Click "View more replies" buttons - limit attempts
+            attempts = 0
+            while attempts < max_attempts:
                 try:
                     reply_buttons = await self.page.query_selector_all(
                         'div[role="button"]:has-text("replies"), '
@@ -349,16 +391,19 @@ class FacebookScraper:
                     if not reply_buttons:
                         break
                     
-                    for button in reply_buttons[:5]:
+                    clicked = False
+                    for button in reply_buttons[:3]:
                         try:
                             await button.scroll_into_view_if_needed()
                             await button.click()
-                            await self.page.wait_for_timeout(500)
-                        except:
-                            pass
+                            await self.page.wait_for_timeout(100)  # Reduced from 500ms
+                            clicked = True
+                        except Exception as e:
+                            logger.warning(f"Failed to click reply button: {e}")
                     
-                    if len(reply_buttons) < 5:
+                    if not clicked:
                         break
+                    attempts += 1
                         
                 except Exception:
                     break
@@ -396,6 +441,371 @@ class FacebookScraper:
         except Exception as e:
             logger.error(f"Error getting comments HTML: {e}")
             return ""
+    
+    async def post_comment(self, message: str) -> bool:
+        """
+        Post a comment on the current Facebook post.
+        
+        Args:
+            message: The comment text to post
+            
+        Returns:
+            True if comment was posted successfully, False otherwise
+        """
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[DEBUG] post_comment() called with message: {message[:50]}...")
+            logger.info(f"[{timestamp}] Starting comment post process")
+            logger.info(f"[{timestamp}] Comment message: {message}")
+            logger.info(f"[{timestamp}] Message length: {len(message)} characters")
+            
+            # Scroll to find comment box
+            print("[DEBUG] Scrolling to bottom...")
+            await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await self.page.wait_for_timeout(1000)
+            
+            # Find comment input box - try multiple selectors
+            print("[DEBUG] Finding comment box...")
+            comment_box = None
+            selectors = [
+                'div[aria-label*="Write a comment"]',
+                'div[aria-label*="เขียนความคิดเห็น"]',
+                'div[contenteditable="true"][role="textbox"]',
+                'div[data-lexical-editor="true"]',
+            ]
+            
+            for selector in selectors:
+                try:
+                    print(f"[DEBUG] Trying selector: {selector}")
+                    comment_box = await self.page.query_selector(selector)
+                    if comment_box:
+                        print(f"[DEBUG] Found comment box with selector: {selector}")
+                        logger.info(f"Found comment box with selector: {selector}")
+                        break
+                except Exception as e:
+                    print(f"[DEBUG] Selector {selector} failed: {e}")
+                    continue
+            
+            if not comment_box:
+                print("[DEBUG] ERROR: Could not find comment input box")
+                logger.error("Could not find comment input box")
+                await self._take_screenshot("error_no_comment_box")
+                return False
+            
+            # Click to focus with force=True
+            print("[DEBUG] Clicking comment box...")
+            await comment_box.scroll_into_view_if_needed()
+            await comment_box.click(force=True)
+            await self.page.wait_for_timeout(500)
+            
+            # Type the message
+            print(f"[DEBUG] Typing message: {message}")
+            await comment_box.type(message, delay=50)
+            await self.page.wait_for_timeout(500)
+            await self._take_screenshot("comment_typed")
+            
+            # Press Enter to submit (more reliable than clicking submit button)
+            print("[DEBUG] Pressing Enter to submit...")
+            logger.info("Pressing Enter to submit comment...")
+            await self.page.keyboard.press('Enter')
+            
+            # Wait for the comment to actually appear (check that comment box is cleared)
+            print("[DEBUG] Waiting for comment box to clear...")
+            try:
+                await self.page.wait_for_function(
+                    """
+                    () => {
+                        const box = document.querySelector('div[contenteditable="true"][role="textbox"]');
+                        return !box || box.textContent.trim() === '';
+                    }
+                    """,
+                    timeout=10000
+                )
+                print("[DEBUG] Comment box cleared - comment posted")
+                logger.info("Comment box cleared - comment posted")
+            except Exception as e:
+                print(f"[DEBUG] Warning: Could not confirm comment box cleared: {e}")
+                logger.warning(f"Could not confirm comment box cleared: {e}")
+            
+            # Check immediately if we're still on the correct post URL (before any delay)
+            current_url = self.page.url
+            expected_url = self.config.get('target', {}).get('post_url', '')
+            
+            # Extract key identifiers from expected URL (permalink or post ID)
+            is_correct_page = False
+            if expected_url:
+                # Check if URL contains the post/permalink identifier
+                if 'permalink' in expected_url:
+                    permalink_id = expected_url.split('permalink/')[-1].split('/')[0].split('?')[0]
+                    is_correct_page = permalink_id in current_url
+                elif 'posts' in expected_url:
+                    post_id = expected_url.split('posts/')[-1].split('/')[0].split('?')[0]
+                    is_correct_page = post_id in current_url
+                else:
+                    # Fallback: check if current URL contains expected URL
+                    is_correct_page = expected_url in current_url
+            
+            if not is_correct_page and expected_url:
+                print(f"[DEBUG] ⚠ Page redirected! Current: {current_url}")
+                print(f"[DEBUG] Expected: {expected_url}")
+                print("[DEBUG] Navigating back to post immediately...")
+                logger.warning(f"Page redirected after posting comment. Current: {current_url}, Expected: {expected_url}")
+                await self.page.goto(expected_url, wait_until="domcontentloaded")
+                await self.page.wait_for_timeout(2000)
+                print("[DEBUG] ✓ Navigated back to post")
+                logger.info("Successfully navigated back to post page")
+            
+            # Now wait to ensure comment appears
+            print("[DEBUG] Waiting 3 seconds for comment to appear...")
+            await self.page.wait_for_timeout(3000)
+            await self._take_screenshot("comment_posted")
+            
+            print("[DEBUG] Comment posted successfully!")
+            from datetime import datetime
+            success_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            logger.info(f"[{success_time}] Comment posted successfully!")
+            logger.info(f"[{success_time}] Posted message: {message}")
+            logger.info(f"[{success_time}] Current URL: {current_url}")
+            return True
+            
+        except Exception as e:
+            from datetime import datetime
+            error_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[DEBUG] EXCEPTION in post_comment: {e}")
+            print(f"[DEBUG] Exception type: {type(e)}")
+            import traceback
+            print(f"[DEBUG] Traceback:\n{traceback.format_exc()}")
+            logger.error(f"[{error_time}] ✗ Error posting comment: {e}")
+            logger.error(f"[{error_time}] Failed message: {message}")
+            logger.error(f"[{error_time}] Exception type: {type(e).__name__}")
+            logger.error(f"[{error_time}] Traceback: {traceback.format_exc()}")
+            await self._take_screenshot("error_post_comment")
+            return False
+    
+    async def reply_to_latest_owner_comment(self, message: str, owner_name: str) -> bool:
+        """
+        Reply to the latest comment from the post owner.
+        
+        Args:
+            message: The reply text to post
+            owner_name: The name of the post owner to identify their comments
+            
+        Returns:
+            True if reply was posted successfully, False otherwise
+        """
+        try:
+            logger.info(f"Looking for latest comment from owner: {owner_name}")
+            
+            # Scroll to top to see all comments
+            await self.page.evaluate("window.scrollTo(0, 0)")
+            await self.page.wait_for_timeout(1000)
+            
+            # Take screenshot to debug
+            await self._take_screenshot("before_find_owner")
+            
+            # Find all comment containers - try multiple selectors
+            comment_selectors = [
+                'div[role="article"]',
+                'div[data-visualcompletion="ignore-dynamic"]',
+            ]
+            
+            owner_comment = None
+            for selector in comment_selectors:
+                comment_divs = await self.page.query_selector_all(selector)
+                logger.info(f"Found {len(comment_divs)} elements with selector: {selector}")
+                
+                for comment_div in comment_divs:
+                    try:
+                        # Get all text content from this comment
+                        text_content = await comment_div.inner_text()
+                        
+                        # Find author link - try multiple selectors
+                        author_selectors = [
+                            'a[role="link"]',
+                            'a[href*="/user/"]',
+                            'a[href*="/profile.php"]',
+                            'span[dir="auto"] a',
+                        ]
+                        
+                        author_text = None
+                        for author_selector in author_selectors:
+                            author_link = await comment_div.query_selector(author_selector)
+                            if author_link:
+                                author_text = await author_link.inner_text()
+                                if author_text and author_text.strip():
+                                    break
+                        
+                        if author_text:
+                            logger.info(f"Checking author: {author_text}")
+                            
+                            # Check if this is the owner's comment
+                            if owner_name.lower() in author_text.lower():
+                                logger.info(f"Found owner comment by: {author_text}")
+                                owner_comment = comment_div
+                                break
+                    except Exception as e:
+                        logger.debug(f"Error checking comment: {e}")
+                        continue
+                
+                if owner_comment:
+                    break
+            
+            if not owner_comment:
+                logger.error(f"Could not find any comment from owner: {owner_name}")
+                await self._take_screenshot("error_no_owner_comment")
+                return False
+            
+            # Scroll to the owner's comment
+            await owner_comment.scroll_into_view_if_needed()
+            await self.page.wait_for_timeout(1000)
+            await self._take_screenshot("found_owner_comment")
+            
+            # Try to find reply button using JavaScript to click the exact element
+            # Look for "ตอบกลับ" text within the owner's comment area
+            try:
+                # Use JavaScript to find and click the reply button - search more thoroughly
+                result = await self.page.evaluate("""
+                    (ownerName) => {
+                        // Find all articles (comments)
+                        const articles = Array.from(document.querySelectorAll('div[role="article"]'));
+                        
+                        for (const article of articles) {
+                            // Check if this is the owner's comment
+                            const authorLinks = article.querySelectorAll('a[role="link"]');
+                            let isOwner = false;
+                            for (const link of authorLinks) {
+                                if (link.innerText.includes(ownerName)) {
+                                    isOwner = true;
+                                    break;
+                                }
+                            }
+                            
+                            if (isOwner) {
+                                // Try to find clickable elements with "ตอบกลับ" text
+                                const walker = document.createTreeWalker(
+                                    article,
+                                    NodeFilter.SHOW_ELEMENT,
+                                    null
+                                );
+                                
+                                const candidates = [];
+                                let node;
+                                while (node = walker.nextNode()) {
+                                    const text = node.textContent.trim();
+                                    if (text === 'ตอบกลับ' || text === 'Reply') {
+                                        candidates.push({
+                                            element: node,
+                                            text: text,
+                                            tag: node.tagName,
+                                            visible: node.offsetParent !== null,
+                                            role: node.getAttribute('role')
+                                        });
+                                    }
+                                }
+                                
+                                // Try to click the first visible candidate
+                                for (const candidate of candidates) {
+                                    if (candidate.visible) {
+                                        candidate.element.click();
+                                        return { success: true, text: candidate.text, tag: candidate.tag };
+                                    }
+                                }
+                                
+                                return { success: false, candidates: candidates.length, details: candidates.map(c => ({tag: c.tag, text: c.text, visible: c.visible})) };
+                            }
+                        }
+                        return { success: false, reason: 'owner not found' };
+                    }
+                """, owner_name)
+                
+                if result.get('success'):
+                    logger.info(f"Clicked reply button via JavaScript: {result.get('text')}")
+                    await self.page.wait_for_timeout(1500)
+                    await self._take_screenshot("reply_clicked")
+                else:
+                    logger.error("Could not find reply button via JavaScript")
+                    await self._take_screenshot("error_no_reply_button")
+                    return False
+                    
+            except Exception as e:
+                logger.error(f"Error clicking reply button: {e}")
+                await self._take_screenshot("error_click_reply")
+                return False
+            
+            # Find reply input box
+            reply_box = None
+            reply_box_selectors = [
+                'div[aria-label*="Write a reply"]',
+                'div[aria-label*="เขียนคำตอบ"]',
+                'div[contenteditable="true"][role="textbox"]',
+            ]
+            
+            for selector in reply_box_selectors:
+                try:
+                    # Get all textboxes and find the one that appeared after clicking reply
+                    boxes = await self.page.query_selector_all(selector)
+                    for box in boxes:
+                        is_visible = await box.is_visible()
+                        if is_visible:
+                            reply_box = box
+                            logger.info(f"Found reply box with selector: {selector}")
+                            break
+                    if reply_box:
+                        break
+                except:
+                    continue
+            
+            if not reply_box:
+                logger.error("Could not find reply input box")
+                await self._take_screenshot("error_no_reply_box")
+                return False
+            
+            # Type the reply
+            await reply_box.click(force=True)
+            await self.page.wait_for_timeout(500)
+            await reply_box.type(message, delay=50)
+            await self.page.wait_for_timeout(500)
+            await self._take_screenshot("reply_typed")
+            
+            # Find and click submit button for reply
+            submit_button = None
+            submit_selectors = [
+                'div[aria-label*="Comment"][role="button"]',
+                'div[aria-label*="ความคิดเห็น"][role="button"]',
+            ]
+            
+            for selector in submit_selectors:
+                try:
+                    buttons = await self.page.query_selector_all(selector)
+                    for button in buttons:
+                        is_visible = await button.is_visible()
+                        if is_visible:
+                            submit_button = button
+                            logger.info(f"Found submit button with selector: {selector}")
+                            break
+                    if submit_button:
+                        break
+                except:
+                    continue
+            
+            if not submit_button:
+                logger.error("Could not find submit button")
+                await self._take_screenshot("error_no_submit_button_reply")
+                return False
+            
+            # Click submit
+            await submit_button.click(force=True)
+            await self.page.wait_for_timeout(2000)
+            await self._take_screenshot("reply_posted")
+            
+            logger.info("Reply posted successfully!")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error posting reply: {e}")
+            await self._take_screenshot("error_post_reply")
+            return False
     
     async def close(self) -> None:
         """Close browser and cleanup."""

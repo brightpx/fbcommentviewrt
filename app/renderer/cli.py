@@ -39,7 +39,7 @@ class CLIRenderer:
         else:
             table.add_row("Last Refresh:", "Never")
         
-        table.add_row("Session Status:", "✅ Active")
+        table.add_row("Session Status:", "Active")
         
         return Panel(
             table,
