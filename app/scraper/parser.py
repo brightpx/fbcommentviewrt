@@ -14,10 +14,11 @@ logger = logging.getLogger(__name__)
 class FacebookParser:
     """Parse Facebook comments from page."""
     
-    def __init__(self, page: Page, max_tier: int = 999, max_comments: int = 0):
+    def __init__(self, page: Page, max_tier: int = 999, max_comments: int = 0, post_url: str = ""):
         self.page = page
         self.max_tier = max_tier
         self.max_comments = max_comments
+        self.post_url = post_url
     
     async def parse_comments(self) -> List[Comment]:
         """Parse all comments from the current page."""
@@ -37,8 +38,25 @@ class FacebookParser:
             # Each comment timestamp link has:
             #   - Top-level:  ?comment_id=XXX
             #   - Reply:      ?comment_id=PARENT_ID&reply_comment_id=REPLY_ID
-            comment_links = soup.find_all('a', href=lambda x: x and 'comment_id=' in x)
-            logger.info(f"Found {len(comment_links)} comment links")
+            all_comment_links = soup.find_all('a', href=lambda x: x and 'comment_id=' in x)
+            logger.info(f"Found {len(all_comment_links)} total comment links")
+            
+            # Filter to only comments from the target post URL
+            # Extract post ID from post_url (e.g., /posts/2972275236267806/)
+            post_id_match = re.search(r'/posts/(\d+)/', self.post_url) or re.search(r'permalink/(\d+)', self.post_url)
+            if post_id_match:
+                post_id = post_id_match.group(1)
+                # Filter comment links that have proper post path structure
+                # Must match: /posts/{post_id}/?comment_id= or permalink/{post_id}?comment_id=
+                post_path_pattern = f'/posts/{post_id}/\\?comment_id='
+                comment_links = [
+                    link for link in all_comment_links 
+                    if re.search(post_path_pattern, link.get('href', ''))
+                ]
+                logger.info(f"Filtered to {len(comment_links)} comments from target post (ID: {post_id})")
+            else:
+                comment_links = all_comment_links
+                logger.warning(f"Could not extract post ID from URL: {self.post_url}")
 
             comment_map: Dict[str, Comment] = {}
             display_order = 0

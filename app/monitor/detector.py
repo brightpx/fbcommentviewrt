@@ -29,9 +29,10 @@ class CommentDetector:
         self.max_tier = config.get('monitor', {}).get('max_tier', 999)
         self.max_comments = config.get('monitor', {}).get('max_comments', 0)
         self.display_limit = config.get('monitor', {}).get('display_limit', 10)
-        self.parser = FacebookParser(scraper.page, max_tier=self.max_tier, max_comments=self.max_comments)
+        self.parser = None  # Will be initialized with post_url in start_monitoring
         self.is_running = False
         self.post_info: Optional[PostInfo] = None
+        self.first_refresh = True  # Track if this is the first refresh to skip page reload
         
         # Callbacks
         self.on_new_comment: Optional[Callable] = None
@@ -41,6 +42,14 @@ class CommentDetector:
     async def start_monitoring(self, post_url: str) -> bool:
         """Start monitoring a post."""
         try:
+            # Initialize parser with post_url for filtering
+            self.parser = FacebookParser(
+                self.scraper.page, 
+                max_tier=self.max_tier, 
+                max_comments=self.max_comments,
+                post_url=post_url
+            )
+            
             # Navigate to post
             if not await self.scraper.navigate_to_post(post_url):
                 return False
@@ -83,15 +92,24 @@ class CommentDetector:
             if not self.is_running or not self.post_info:
                 return []
             
-            # Check if force_refresh_mode is enabled
-            force_refresh = self.config.get('monitor', {}).get('force_refresh_mode', False)
-            if force_refresh:
-                logger.info("Force refresh mode enabled - toggling sorting to refresh")
-                await self.scraper.force_refresh_comments()
-                # Wait a bit and scroll to ensure comments are loaded
-                await self.scraper.page.wait_for_timeout(200)
-                await self.scraper.page.evaluate("window.scrollBy(0, 200)")
-                await self.scraper.page.wait_for_timeout(100)
+            # Skip refresh on first run (page already loaded during startup)
+            if self.first_refresh:
+                logger.info("First refresh - skipping page reload (already loaded)")
+                self.first_refresh = False
+            else:
+                # Check if force_refresh_mode is enabled
+                force_refresh = self.config.get('monitor', {}).get('force_refresh_mode', False)
+                if force_refresh:
+                    logger.info("Force refresh mode enabled - toggling sorting to refresh")
+                    await self.scraper.force_refresh_comments()
+                    # Wait a bit and scroll to ensure comments are loaded
+                    await self.scraper.page.wait_for_timeout(200)
+                    await self.scraper.page.evaluate("window.scrollBy(0, 200)")
+                    await self.scraper.page.wait_for_timeout(100)
+                else:
+                    # Use fast page refresh instead of full navigation
+                    logger.info("Using fast page refresh")
+                    await self.scraper.refresh_page()
             
             # Expand all comments
             await self.scraper.expand_all_comments(max_tier=self.max_tier)
@@ -123,7 +141,7 @@ class CommentDetector:
             
             if self.on_refresh:
                 logger.info("Calling on_refresh callback now...")
-                await self.on_refresh(comments, len(new_comments), len(updated_comments))
+                await self.on_refresh(comments, self.post_info)
                 logger.info("on_refresh callback completed")
             else:
                 logger.warning("on_refresh callback is None, cannot call!")
@@ -160,7 +178,7 @@ class CommentDetector:
                 # Update CLI every 1 second regardless of refresh status
                 if self.on_refresh:
                     comments = await self.database.get_comments(self.post_info.url, limit=self.display_limit)
-                    await self.on_refresh(comments, 0, 0)
+                    await self.on_refresh(comments, self.post_info)
                 
                 await asyncio.sleep(1.0)  # Fixed 1 second CLI update
                 

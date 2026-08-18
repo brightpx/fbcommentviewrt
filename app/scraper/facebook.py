@@ -240,6 +240,21 @@ class FacebookScraper:
             await self._take_screenshot("06_switch_error")
             return False
     
+    async def refresh_page(self) -> bool:
+        """
+        Refresh the current page quickly using page.reload().
+        Much faster than full navigation.
+        """
+        try:
+            logger.info("Refreshing page...")
+            await self.page.reload(wait_until="domcontentloaded")
+            await self.page.wait_for_timeout(500)
+            logger.info("Page refresh completed")
+            return True
+        except Exception as e:
+            logger.error(f"Error during page refresh: {e}")
+            return False
+    
     async def force_refresh_comments(self) -> bool:
         """
         Force refresh comments by toggling sorting mode.
