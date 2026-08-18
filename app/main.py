@@ -116,7 +116,7 @@ class FacebookCommentMonitor:
                 self.renderer.show_info(f"Opening post: {post_url}")
                 try:
                     await self.scraper.page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
-                    await self.scraper.page.wait_for_timeout(2000)
+                    await self.scraper.page.wait_for_timeout(self.config['monitor']['timings']['after_goto_post'])
                     
                     # Check if login is required (redirected to login page)
                     current_url = self.scraper.page.url
@@ -210,7 +210,7 @@ class FacebookCommentMonitor:
             
             # Small sleep to avoid busy-waiting
             import time
-            time.sleep(0.1)
+            time.sleep(self.config['monitor']['timings']['keyboard_poll_interval'] / 1000.0)
     
     async def _check_and_post_comment(self) -> None:
         """Check if comment post is requested and post it."""
@@ -250,13 +250,13 @@ class FacebookCommentMonitor:
                 logger.info(f"[{log_time}] Posted message: {message}")
                 self.renderer.show_success(f"Comment posted: {message}")
                 self.renderer.show_info("Waiting for comment to appear...")
-                await asyncio.sleep(5)
+                await asyncio.sleep(self.config['monitor']['timings']['after_post_success'] / 1000.0)
                 # Force refresh to show new comment immediately
                 comments = await self.detector.refresh_comments()
                 # Update display with new comments
                 self.renderer.start_live_display(self.detector.post_info, comments)
                 self.renderer.show_success("New comment displayed!")
-                await asyncio.sleep(5)  # Give user time to see the new comment before next refresh cycle
+                await asyncio.sleep(self.config['monitor']['timings']['display_new_comment'] / 1000.0)  # Give user time to see the new comment before next refresh cycle
             else:
                 logger.error(f"[{log_time}] ✗ Failed to post manual comment")
                 logger.error(f"[{log_time}] Failed message: {message}")
@@ -290,12 +290,12 @@ class FacebookCommentMonitor:
                 logger.info(f"[{log_time}] Comment posted successfully: {message}")
                 self.renderer.show_success(f"Comment posted: {message}")
                 self.renderer.show_info("Waiting 5 seconds for comment to appear...")
-                await asyncio.sleep(5)
+                await asyncio.sleep(self.config['monitor']['timings']['after_post_success'] / 1000.0)
                 # Force refresh to show new comment immediately
                 await self.detector.refresh_comments()
                 # Give user time to see the new comment before next refresh cycle
                 self.renderer.show_success("New comment displayed! Resuming normal refresh cycle...")
-                await asyncio.sleep(3)
+                await asyncio.sleep(self.config['monitor']['timings']['after_post_refresh'] / 1000.0)
                 return True
             else:
                 logger.error(f"[{log_time}] ✗ Failed to post comment: {message}")
@@ -353,7 +353,7 @@ class FacebookCommentMonitor:
                     raise  # Re-raise to propagate to main()
                 except Exception as e:
                     logger.error(f"Error in monitor loop: {e}")
-                    await asyncio.sleep(1.0)
+                    await asyncio.sleep(self.config['monitor']['timings']['error_retry_delay'] / 1000.0)
             
         except KeyboardInterrupt:
             # User pressed Ctrl+C - stop and cleanup

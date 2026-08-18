@@ -102,7 +102,7 @@ class FacebookScraper:
         """Check if user is logged in to Facebook."""
         try:
             await self.page.goto("https://www.facebook.com", wait_until="domcontentloaded", timeout=10000)
-            await self.page.wait_for_timeout(2000)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['after_login_check'])
             
             # Check for common logged-in indicators
             is_logged_in = await self.page.evaluate("""
@@ -146,9 +146,9 @@ class FacebookScraper:
             
             # Get scroll_times from config for initial load
             scroll_times = self.config.get('monitor', {}).get('scroll_times', 2)
-            wait_time = 500 if scroll_times <= 2 else 1000  # Shorter wait for fewer scrolls
+            wait_time = self.config['browser']['timings']['scroll_wait']
             
-            await self.page.wait_for_timeout(wait_time)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['after_navigation'])
             
             # Scroll down to load comments (use config scroll_times)
             logger.info(f"Initial scroll ({scroll_times} times) to load comments...")
@@ -161,7 +161,7 @@ class FacebookScraper:
                     window.scrollTo(0, 0);
                 }}
             """)
-            await self.page.wait_for_timeout(500)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['after_scroll'])
             
             # Take screenshot after initial load
             await self._take_screenshot("01_after_navigation")
@@ -170,6 +170,78 @@ class FacebookScraper:
         except Exception as e:
             logger.error(f"Failed to navigate to post: {e}")
             return False
+    
+    async def get_post_author(self) -> Optional[str]:
+        """Extract the post author's name from the current page.
+        
+        Returns:
+            Post author name, or None if not found
+        """
+        try:
+            logger.info("Extracting post author name...")
+            
+            # Scroll to top to ensure post author is visible
+            await self.page.evaluate("window.scrollTo(0, 0)")
+            await self.page.wait_for_timeout(self.config['browser']['timings']['post_author_wait'])
+            
+            # Strategy 1: Extract from Facebook's embedded JSON data (owning_profile)
+            try:
+                author_name = await self.page.evaluate("""
+                    () => {
+                        // Find all script tags containing JSON data
+                        const scripts = document.querySelectorAll('script[type="application/json"]');
+                        for (const script of scripts) {
+                            try {
+                                const text = script.textContent;
+                                if (text && text.includes('owning_profile')) {
+                                    // Try to find owning_profile pattern
+                                    const match = text.match(/"owning_profile":\\{[^}]*"name":"([^"]+)"/);
+                                    if (match && match[1]) {
+                                        return match[1];
+                                    }
+                                }
+                            } catch (e) {}
+                        }
+                        return null;
+                    }
+                """)
+                if author_name:
+                    logger.info(f"Found post author from owning_profile: {author_name}")
+                    return author_name
+            except Exception as e:
+                logger.debug(f"owning_profile strategy failed: {e}")
+            
+            # Strategy 2: Try og:title meta tag
+            try:
+                title_element = await self.page.query_selector('meta[property="og:title"]')
+                if title_element:
+                    title_content = await title_element.get_attribute('content')
+                    if title_content and ' - ' in title_content:
+                        author_text = title_content.split(' - ')[0].strip()
+                        if author_text and len(author_text) > 2:
+                            logger.info(f"Found post author from og:title: {author_text}")
+                            return author_text
+            except Exception as e:
+                logger.debug(f"og:title strategy failed: {e}")
+            
+            # Strategy 3: Find header strong tag
+            try:
+                author_element = await self.page.query_selector('div[role="article"] h2 strong, div[role="article"] h3 strong, div[role="article"] h4 strong')
+                if author_element:
+                    author_text = await author_element.inner_text()
+                    author_text = author_text.strip()
+                    if author_text and len(author_text) > 2:
+                        logger.info(f"Found post author from header: {author_text}")
+                        return author_text
+            except Exception as e:
+                logger.debug(f"Header strategy failed: {e}")
+            
+            logger.warning("Could not extract post author name")
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting post author: {e}")
+            return None
     
     async def switch_to_most_recent(self) -> bool:
         """Switch comment sorting to 'Most Recent' mode."""
@@ -225,7 +297,7 @@ class FacebookScraper:
             # Click sorting button
             await sorting_button.scroll_into_view_if_needed()
             await sorting_button.click()
-            await self.page.wait_for_timeout(300)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['dropdown_wait'])
             await self._take_screenshot("03_sorting_menu_opened")
             
             # Click target sorting option
@@ -253,7 +325,7 @@ class FacebookScraper:
             
             # Click the sorting option
             await target_option.click()
-            await self.page.wait_for_timeout(2000)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['sorting_mode_switch'])
             await self._take_screenshot(f"05_switched_to_{mode}")
             
             logger.info(f"Successfully switched to '{mode}' view")
@@ -272,7 +344,7 @@ class FacebookScraper:
         try:
             logger.info("Refreshing page...")
             await self.page.reload(wait_until="domcontentloaded")
-            await self.page.wait_for_timeout(500)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['page_refresh'])
             logger.info("Page refresh completed")
             return True
         except Exception as e:
@@ -294,19 +366,19 @@ class FacebookScraper:
                 # Try most_relevant as alternative
                 success = await self.switch_sorting_mode("most_relevant")
             
-            await self.page.wait_for_timeout(200)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['force_refresh_toggle'])
             
             # Scroll slightly to trigger content load
             await self.page.evaluate("window.scrollBy(0, 100)")
-            await self.page.wait_for_timeout(100)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['force_refresh_scroll'])
             
             # Switch back to "most recent" mode
             await self.switch_sorting_mode("most_recent")
-            await self.page.wait_for_timeout(200)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['force_refresh_toggle'])
             
             # Scroll slightly again to trigger content load
             await self.page.evaluate("window.scrollBy(0, 100)")
-            await self.page.wait_for_timeout(100)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['force_refresh_scroll'])
             
             logger.info("Force refresh completed - comments should be updated")
             return True
@@ -334,7 +406,7 @@ class FacebookScraper:
         try:
             # Scroll down to load more comments first
             await self.page.evaluate("window.scrollBy(0, 500)")
-            await self.page.wait_for_timeout(300)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['expand_scroll'])
             
             # Click "View more comments" buttons - limit attempts to avoid hanging
             max_attempts = 3
@@ -356,7 +428,7 @@ class FacebookScraper:
                         try:
                             await button.scroll_into_view_if_needed()
                             await button.click(force=True, timeout=5000)  # Force click with 5s timeout
-                            await self.page.wait_for_timeout(100)  # Reduced from 500ms
+                            await self.page.wait_for_timeout(self.config['browser']['timings']['expand_button_click'])
                             clicked = True
                             total_clicked += 1
                         except Exception as e:
@@ -396,7 +468,7 @@ class FacebookScraper:
                         try:
                             await button.scroll_into_view_if_needed()
                             await button.click()
-                            await self.page.wait_for_timeout(100)  # Reduced from 500ms
+                            await self.page.wait_for_timeout(self.config['browser']['timings']['expand_button_click'])
                             clicked = True
                         except Exception as e:
                             logger.warning(f"Failed to click reply button: {e}")
@@ -421,14 +493,14 @@ class FacebookScraper:
             logger.info(f"Scrolling {scroll_times} times to load comments...")
             for i in range(scroll_times):
                 await self.page.evaluate("window.scrollBy(0, 1000)")
-                await self.page.wait_for_timeout(1000)
+                await self.page.wait_for_timeout(self.config['browser']['timings']['click_button_wait'])
             
             # Take screenshot after scrolling
             await self._take_screenshot("07_after_scrolling")
             
             # Scroll back to top
             await self.page.evaluate("window.scrollTo(0, 0)")
-            await self.page.wait_for_timeout(500)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['after_scroll'])
             
             # Find the main comments container
             html = await self.page.evaluate("""
@@ -463,7 +535,7 @@ class FacebookScraper:
             # Scroll to find comment box
             print("[DEBUG] Scrolling to bottom...")
             await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await self.page.wait_for_timeout(1000)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['scroll_to_comment_box'])
             
             # Find comment input box - try multiple selectors
             print("[DEBUG] Finding comment box...")
@@ -497,12 +569,12 @@ class FacebookScraper:
             print("[DEBUG] Clicking comment box...")
             await comment_box.scroll_into_view_if_needed()
             await comment_box.click(force=True)
-            await self.page.wait_for_timeout(500)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['after_scroll'])
             
             # Type the message
             print(f"[DEBUG] Typing message: {message}")
-            await comment_box.type(message, delay=50)
-            await self.page.wait_for_timeout(500)
+            await comment_box.type(message, delay=self.config['auto_reply']['timings']['type_delay'])
+            await self.page.wait_for_timeout(self.config['browser']['timings']['after_scroll'])
             await self._take_screenshot("comment_typed")
             
             # Press Enter to submit (more reliable than clicking submit button)
@@ -552,13 +624,13 @@ class FacebookScraper:
                 print("[DEBUG] Navigating back to post immediately...")
                 logger.warning(f"Page redirected after posting comment. Current: {current_url}, Expected: {expected_url}")
                 await self.page.goto(expected_url, wait_until="domcontentloaded")
-                await self.page.wait_for_timeout(2000)
+                await self.page.wait_for_timeout(self.config['browser']['timings']['sorting_mode_switch'])
                 print("[DEBUG] ✓ Navigated back to post")
                 logger.info("Successfully navigated back to post page")
             
             # Now wait to ensure comment appears
             print("[DEBUG] Waiting 3 seconds for comment to appear...")
-            await self.page.wait_for_timeout(3000)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['after_comment_post'])
             await self._take_screenshot("comment_posted")
             
             print("[DEBUG] Comment posted successfully!")
@@ -599,7 +671,7 @@ class FacebookScraper:
             
             # Scroll to top to see all comments
             await self.page.evaluate("window.scrollTo(0, 0)")
-            await self.page.wait_for_timeout(1000)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['click_button_wait'])
             
             # Take screenshot to debug
             await self._take_screenshot("before_find_owner")
@@ -658,7 +730,7 @@ class FacebookScraper:
             
             # Scroll to the owner's comment
             await owner_comment.scroll_into_view_if_needed()
-            await self.page.wait_for_timeout(1000)
+            await self.page.wait_for_timeout(self.config['browser']['timings']['click_button_wait'])
             await self._take_screenshot("found_owner_comment")
             
             # Try to find reply button using JavaScript to click the exact element
@@ -721,7 +793,7 @@ class FacebookScraper:
                 
                 if result.get('success'):
                     logger.info(f"Clicked reply button via JavaScript: {result.get('text')}")
-                    await self.page.wait_for_timeout(1500)
+                    await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_click_reply'])
                     await self._take_screenshot("reply_clicked")
                 else:
                     logger.error("Could not find reply button via JavaScript")
@@ -763,9 +835,9 @@ class FacebookScraper:
             
             # Type the reply
             await reply_box.click(force=True)
-            await self.page.wait_for_timeout(500)
-            await reply_box.type(message, delay=50)
-            await self.page.wait_for_timeout(500)
+            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['before_type'])
+            await reply_box.type(message, delay=self.config['auto_reply']['timings']['type_delay'])
+            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_type'])
             await self._take_screenshot("reply_typed")
             
             # Find and click submit button for reply
@@ -796,7 +868,7 @@ class FacebookScraper:
             
             # Click submit
             await submit_button.click(force=True)
-            await self.page.wait_for_timeout(2000)
+            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_submit'])
             await self._take_screenshot("reply_posted")
             
             logger.info("Reply posted successfully!")
@@ -805,6 +877,164 @@ class FacebookScraper:
         except Exception as e:
             logger.error(f"Error posting reply: {e}")
             await self._take_screenshot("error_post_reply")
+            return False
+    
+    async def reply_to_comment(self, comment_id: str, message: str) -> bool:
+        """Reply to a specific comment by ID.
+        
+        Args:
+            comment_id: The Facebook comment ID to reply to
+            message: The reply message text
+            
+        Returns:
+            True if reply posted successfully, False otherwise
+        """
+        try:
+            logger.info(f"Attempting to reply to comment {comment_id}")
+            logger.info(f"Reply message: {message[:50]}...")
+            
+            # Try to expand "View more comments" if present
+            try:
+                expand_selectors = [
+                    'div[role="button"]:has-text("View more comments")',
+                    'div[role="button"]:has-text("ดูความคิดเห็นเพิ่มเติม")',
+                    'span:has-text("View more comments")',
+                    'span:has-text("ดูความคิดเห็นเพิ่มเติม")'
+                ]
+                for selector in expand_selectors:
+                    try:
+                        expand_btn = await self.page.query_selector(selector)
+                        if expand_btn and await expand_btn.is_visible():
+                            logger.info("Found 'View more comments' button, clicking to expand...")
+                            await expand_btn.click()
+                            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['expand_comments'])
+                            break
+                    except:
+                        continue
+            except Exception as e:
+                logger.debug(f"No expand button found or error expanding: {e}")
+            
+            # Find the comment by looking for a link containing the comment_id
+            comment_link = await self.page.query_selector(f'a[href*="comment_id={comment_id}"]')
+            
+            if not comment_link:
+                logger.error(f"Could not find comment with ID {comment_id}")
+                await self._take_screenshot("error_comment_not_found")
+                return False
+            
+            # Find the comment container (article)
+            comment_container = await comment_link.evaluate_handle(
+                """(element) => {
+                    let current = element;
+                    while (current && current.tagName !== 'BODY') {
+                        if (current.getAttribute('role') === 'article') {
+                            return current;
+                        }
+                        current = current.parentElement;
+                    }
+                    return null;
+                }"""
+            )
+            
+            if not comment_container:
+                logger.error("Could not find comment container")
+                await self._take_screenshot("error_no_container")
+                return False
+            
+            # Scroll to the comment
+            await comment_container.scroll_into_view_if_needed()
+            await self.page.wait_for_timeout(self.config['browser']['timings']['after_scroll'])
+            await self._take_screenshot("found_target_comment")
+            
+            # Find and click the reply button within this container
+            reply_clicked = await comment_container.evaluate(
+                """(container) => {
+                    // Look for reply button text
+                    const walker = document.createTreeWalker(
+                        container,
+                        NodeFilter.SHOW_ELEMENT,
+                        null
+                    );
+                    
+                    let node;
+                    while (node = walker.nextNode()) {
+                        const text = node.textContent.trim();
+                        if ((text === 'ตอบกลับ' || text === 'Reply') && 
+                            node.getAttribute('role') === 'button' &&
+                            node.offsetParent !== null) {
+                            node.click();
+                            return true;
+                        }
+                    }
+                    return false;
+                }"""
+            )
+            
+            if not reply_clicked:
+                logger.error("Could not find or click reply button")
+                await self._take_screenshot("error_no_reply_button")
+                return False
+            
+            logger.info("Reply button clicked")
+            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_click_reply'])
+            await self._take_screenshot("reply_button_clicked")
+            
+            # Find the reply input box - could be in a popup dialog or inline
+            reply_box = None
+            reply_selectors = [
+                # Check for popup/dialog first (Facebook often shows reply in a popup)
+                'div[role="dialog"] div[contenteditable="true"][role="textbox"]',
+                'div[role="dialog"] div[aria-label*="Write"]',
+                'div[role="dialog"] div[aria-label*="เขียน"]',
+                # Then check for inline reply
+                'div[aria-label*="Write a reply"]',
+                'div[aria-label*="เขียนคำตอบ"]',
+                'div[contenteditable="true"][role="textbox"]',
+            ]
+            
+            for selector in reply_selectors:
+                try:
+                    boxes = await self.page.query_selector_all(selector)
+                    for box in boxes:
+                        is_visible = await box.is_visible()
+                        if is_visible:
+                            reply_box = box
+                            logger.info(f"Found reply input box with selector: {selector}")
+                            break
+                    if reply_box:
+                        break
+                except Exception as e:
+                    logger.debug(f"Selector {selector} failed: {e}")
+                    continue
+            
+            if not reply_box:
+                logger.error("Could not find reply input box")
+                await self._take_screenshot("error_no_reply_input")
+                return False
+            
+            # Type the reply message
+            await reply_box.click(force=True)
+            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['before_type'])
+            await reply_box.type(message, delay=self.config['auto_reply']['timings']['type_delay'])
+            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_type'])
+            await self._take_screenshot("reply_message_typed")
+            
+            # Press Enter to submit
+            logger.info("Pressing Enter to submit reply...")
+            await self.page.keyboard.press('Enter')
+            
+            # Wait for reply to post
+            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_submit'])
+            await self._take_screenshot("reply_submitted")
+            
+            logger.info(f"Reply posted successfully to comment {comment_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error replying to comment {comment_id}: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            await self._take_screenshot("error_reply_exception")
             return False
     
     async def close(self) -> None:

@@ -33,6 +33,7 @@ class CommentDetector:
         self.is_running = False
         self.post_info: Optional[PostInfo] = None
         self.first_refresh = True  # Track if this is the first refresh to skip page reload
+        self.post_author_name: Optional[str] = None  # Will be extracted from post
         
         # Callbacks
         self.on_new_comment: Optional[Callable] = None
@@ -53,6 +54,13 @@ class CommentDetector:
             # Navigate to post
             if not await self.scraper.navigate_to_post(post_url):
                 return False
+            
+            # Extract post author for auto-reply
+            self.post_author_name = await self.scraper.get_post_author()
+            if self.post_author_name:
+                logger.info(f"Post author detected: {self.post_author_name}")
+            else:
+                logger.warning("Could not detect post author - auto reply may not work")
             
             # Get sorting mode from config
             sorting_mode = self.config.get('monitor', {}).get('sorting_mode', 'most_recent')
@@ -103,9 +111,9 @@ class CommentDetector:
                     logger.info("Force refresh mode enabled - toggling sorting to refresh")
                     await self.scraper.force_refresh_comments()
                     # Wait a bit and scroll to ensure comments are loaded
-                    await self.scraper.page.wait_for_timeout(200)
+                    await self.scraper.page.wait_for_timeout(self.config['monitor']['timings']['force_refresh_scroll_wait'])
                     await self.scraper.page.evaluate("window.scrollBy(0, 200)")
-                    await self.scraper.page.wait_for_timeout(100)
+                    await self.scraper.page.wait_for_timeout(self.config['monitor']['timings']['force_refresh_scroll_delay'])
                 else:
                     # Use fast page refresh instead of full navigation
                     logger.info("Using fast page refresh")
@@ -117,9 +125,9 @@ class CommentDetector:
             
             # Force scroll to ensure Facebook loads all comments (especially new ones)
             await self.scraper.page.evaluate("window.scrollTo(0, 0)")
-            await self.scraper.page.wait_for_timeout(500)
+            await self.scraper.page.wait_for_timeout(self.config['monitor']['timings']['page_refresh_scroll_wait'])
             await self.scraper.page.evaluate("window.scrollBy(0, 300)")
-            await self.scraper.page.wait_for_timeout(500)
+            await self.scraper.page.wait_for_timeout(self.config['monitor']['timings']['page_refresh_scroll_down'])
             
             # Parse comments
             comments = await self.parser.parse_comments()
@@ -148,6 +156,9 @@ class CommentDetector:
                     await self.on_new_comment(comment)
                 elif comment.tier > 1 and self.on_new_reply:
                     await self.on_new_reply(comment)
+                
+                # Auto reply if enabled and author matches
+                await self._check_auto_reply(comment)
             
             if self.on_refresh:
                 logger.info("Calling on_refresh callback now...")
@@ -187,12 +198,52 @@ class CommentDetector:
                 raise  # Re-raise to propagate to main()
             except Exception as e:
                 logger.error(f"Error in monitor loop: {e}")
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(self.config['monitor']['timings']['error_retry_delay'] / 1000.0)
     
     def stop_monitoring(self) -> None:
         """Stop monitoring."""
         self.is_running = False
         logger.info("Stopped monitoring")
+    
+    async def _check_auto_reply(self, comment: Comment) -> None:
+        """Check if auto reply should be triggered for this comment."""
+        try:
+            # Check if auto_reply is enabled
+            auto_reply_config = self.config.get('auto_reply', {})
+            if not auto_reply_config.get('enabled', False):
+                return
+            
+            # Use detected post author (from page) instead of config
+            post_owner_name = self.post_author_name
+            if not post_owner_name:
+                logger.warning("Auto reply enabled but post author was not detected")
+                return
+            
+            reply_message = auto_reply_config.get('reply_message', '').strip()
+            if not reply_message:
+                logger.warning("Auto reply enabled but reply_message is empty")
+                return
+            
+            reply_tier = auto_reply_config.get('reply_tier', 2)
+            
+            # Check if this comment matches criteria
+            # 1. Comment tier must be reply_tier - 1 (e.g., tier 1 for reply_tier 2)
+            # 2. Author must be the post owner
+            if comment.tier == reply_tier - 1 and post_owner_name.lower() in comment.author.lower():
+                logger.info(f"Auto reply triggered for post owner's comment by {comment.author}")
+                logger.info(f"Comment ID: {comment.id}")
+                logger.info(f"Comment: {comment.message[:50]}...")
+                
+                # Post reply using the new reply_to_comment function
+                success = await self.scraper.reply_to_comment(comment.id, reply_message)
+                
+                if success:
+                    logger.info(f"Auto reply posted successfully to comment {comment.id}")
+                else:
+                    logger.error(f"Failed to post auto reply to comment {comment.id}")
+                    
+        except Exception as e:
+            logger.error(f"Error in auto reply: {e}", exc_info=True)
     
     def _flatten_comments(self, comments: List[Comment]) -> List[Comment]:
         """Flatten nested comment tree."""
