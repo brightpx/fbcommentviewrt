@@ -26,7 +26,9 @@ class CommentDetector:
         self.database = database
         self.config = config
         self.cache = CommentCache()
-        self.parser = FacebookParser(scraper.page)
+        self.max_tier = config.get('monitor', {}).get('max_tier', 999)
+        self.max_comments = config.get('monitor', {}).get('max_comments', 0)
+        self.parser = FacebookParser(scraper.page, max_tier=self.max_tier, max_comments=self.max_comments)
         self.is_running = False
         self.post_info: Optional[PostInfo] = None
         
@@ -78,7 +80,7 @@ class CommentDetector:
                 return []
             
             # Expand all comments
-            await self.scraper.expand_all_comments()
+            await self.scraper.expand_all_comments(max_tier=self.max_tier)
             
             # Parse comments
             comments = await self.parser.parse_comments()
@@ -90,11 +92,13 @@ class CommentDetector:
             all_flat_comments = self._flatten_comments(comments)
             await self.database.save_comments_batch(all_flat_comments, self.post_info.url)
             
-            # Update statistics
-            total_comments, total_replies = await self.database.get_statistics(self.post_info.url)
-            self.post_info.total_comments = total_comments
-            self.post_info.total_replies = total_replies
+            # Update last refresh time only (no statistics)
             self.post_info.last_refresh = datetime.now()
+            
+            logger.info(f"Calling on_refresh callback with {len(comments)} comments, {len(new_comments)} new, {len(updated_comments)} updated")
+            logger.info(f"self.on_refresh = {self.on_refresh}")
+            logger.info(f"self.on_new_comment = {self.on_new_comment}")
+            logger.info(f"self.on_new_reply = {self.on_new_reply}")
             
             # Trigger callbacks
             for comment in new_comments:
@@ -104,7 +108,11 @@ class CommentDetector:
                     await self.on_new_reply(comment)
             
             if self.on_refresh:
+                logger.info("Calling on_refresh callback now...")
                 await self.on_refresh(comments, len(new_comments), len(updated_comments))
+                logger.info("on_refresh callback completed")
+            else:
+                logger.warning("on_refresh callback is None, cannot call!")
             
             return comments
             
@@ -118,7 +126,9 @@ class CommentDetector:
             logger.error("Failed to start monitoring")
             return
         
-        refresh_interval = self.config['monitor']['refresh_interval']
+        # Convert milliseconds to seconds for asyncio.sleep
+        refresh_interval_ms = self.config['monitor']['refresh_interval']
+        refresh_interval = refresh_interval_ms / 1000.0
         
         while self.is_running:
             try:

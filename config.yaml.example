@@ -7,7 +7,7 @@ target:
 
 # Browser settings
 browser:
-  headless: false  # Set to true for production
+  headless: false  # false = เปิด browser ให้เห็น, true = ซ่อน browser (รันเบื้องหลัง)
   timeout: 30000   # milliseconds
   slow_mo: 100     # milliseconds between actions
 
@@ -19,7 +19,7 @@ session:
 
 # Monitor settings
 monitor:
-  refresh_interval: 0.5  # seconds
+  refresh_interval: 2000  # milliseconds (เวลาที่รอระหว่างการ refresh คอมเมนต์)
   max_comments: 10000
   enable_notifications: true
   sorting_mode: "most_recent"  # Options: "most_recent" (ใหม่ล่าสุด), "most_relevant" (เกี่ยวข้องมากที่สุด), "all" (ทั้งหมด)

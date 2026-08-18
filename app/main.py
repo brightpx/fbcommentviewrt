@@ -24,8 +24,7 @@ def setup_logging(config: dict) -> None:
         level=getattr(logging, log_config['level']),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_config['file']),
-            logging.StreamHandler()
+            logging.FileHandler(log_config['file'])
         ]
     )
 
@@ -100,20 +99,50 @@ class FacebookCommentMonitor:
             await self.scraper.initialize()
             self.renderer.show_success("Browser initialized")
             
-            # Check login status
-            is_logged_in = await self.scraper.is_logged_in()
+            # Get post URL from config early
+            post_url = self.config.get('target', {}).get('post_url', '')
             
-            if not is_logged_in:
-                self.renderer.show_warning("Not logged in to Facebook")
-                self.renderer.show_info("Please login in the browser window...")
-                
-                if not await self.scraper.login():
-                    self.renderer.show_error("Login failed")
+            # Navigate to post_url directly (will check login there)
+            if post_url and post_url != "https://www.facebook.com/groups/YOUR_GROUP_ID/posts/YOUR_POST_ID/":
+                self.renderer.show_info(f"Opening post: {post_url}")
+                try:
+                    await self.scraper.page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+                    await self.scraper.page.wait_for_timeout(2000)
+                    
+                    # Check if login is required (redirected to login page)
+                    current_url = self.scraper.page.url
+                    if "login" in current_url.lower():
+                        self.renderer.show_warning("Not logged in to Facebook")
+                        self.renderer.show_info("Please login in the browser window...")
+                        
+                        if not await self.scraper.login():
+                            self.renderer.show_error("Login failed")
+                            return False
+                        
+                        self.renderer.show_success("Login successful")
+                        # Navigate back to post after login
+                        await self.scraper.page.goto(post_url, wait_until="domcontentloaded", timeout=30000)
+                    else:
+                        self.renderer.show_success("Already logged in to Facebook")
+                except Exception as e:
+                    logger.error(f"Error navigating to post: {e}")
+                    self.renderer.show_error(f"Failed to open post: {e}")
                     return False
-                
-                self.renderer.show_success("Login successful")
             else:
-                self.renderer.show_success("Already logged in to Facebook")
+                # No valid post_url, check login status normally
+                is_logged_in = await self.scraper.is_logged_in()
+                
+                if not is_logged_in:
+                    self.renderer.show_warning("Not logged in to Facebook")
+                    self.renderer.show_info("Please login in the browser window...")
+                    
+                    if not await self.scraper.login():
+                        self.renderer.show_error("Login failed")
+                        return False
+                    
+                    self.renderer.show_success("Login successful")
+                else:
+                    self.renderer.show_success("Already logged in to Facebook")
             
             # Initialize detector
             self.detector = CommentDetector(
@@ -146,8 +175,11 @@ class FacebookCommentMonitor:
     
     async def _on_refresh(self, comments: list, new_count: int, updated_count: int) -> None:
         """Callback for refresh."""
+        logger.info(f"_on_refresh called with {len(comments)} comments, new={new_count}, updated={updated_count}")
         if self.detector.post_info:
+            logger.info("Calling renderer.update_display...")
             self.renderer.update_display(self.detector.post_info, comments)
+            logger.info("renderer.update_display completed")
     
     async def start_monitoring(self, post_url: str) -> None:
         """Start monitoring a post."""

@@ -39,13 +39,6 @@ class CLIRenderer:
         else:
             table.add_row("Last Refresh:", "Never")
         
-        if self.post_info:
-            table.add_row("Total Comments:", str(self.post_info.total_comments))
-            table.add_row("Total Replies:", str(self.post_info.total_replies))
-        else:
-            table.add_row("Total Comments:", "0")
-            table.add_row("Total Replies:", "0")
-        
         table.add_row("Session Status:", "✅ Active")
         
         return Panel(
@@ -56,59 +49,75 @@ class CLIRenderer:
         )
     
     def create_comment_table(self) -> Table:
-        """Create comment table view (one row per comment)."""
+        """Create comment table view (one row per comment, with nested replies indented)."""
         display_limit = self.config.get('monitor', {}).get('display_limit', 50)
-        
+
+        # Sort by display_order ascending (display_order=0 is newest comment from Facebook)
+        sorted_comments = sorted(self.comments, key=lambda c: c.display_order, reverse=False)
+
         if display_limit == 0:
-            title = f"📝 Comments (showing all {len(self.comments)})"
-            comments_to_show = self.comments
+            title = f"Comments (showing all {len(sorted_comments)})"
+            comments_to_show = sorted_comments
         else:
-            actual_limit = min(display_limit, len(self.comments))
-            title = f"📝 Comments (showing last {actual_limit} of {len(self.comments)})"
-            comments_to_show = self.comments[-display_limit:] if len(self.comments) > display_limit else self.comments
-        
-        table = Table(title=title, box=box.ROUNDED, show_header=True, header_style="bold cyan")
-        table.add_column("Tier", width=6, style="dim")
-        table.add_column("Author", width=25)
-        table.add_column("Message", width=60)
-        table.add_column("Time", width=25)
-        
+            actual_limit = min(display_limit, len(sorted_comments))
+            title = f"Comments (showing first {actual_limit} of {len(sorted_comments)})"
+            comments_to_show = sorted_comments[:display_limit] if len(sorted_comments) > display_limit else sorted_comments
+
+        table = Table(
+            title=title,
+            box=box.SIMPLE_HEAVY,
+            show_header=True,
+            header_style="bold cyan",
+            padding=(0, 1),
+            show_lines=False,
+        )
+        table.add_column("Tier", width=5, no_wrap=True)
+        table.add_column("Author", width=22, no_wrap=True)
+        table.add_column("Message", min_width=40, ratio=1)
+        table.add_column("Time", width=20, no_wrap=True, style="dim")
+
         if not self.comments:
             table.add_row("", "", "[dim]No comments yet...[/dim]", "")
             return table
-        
+
         for comment in comments_to_show:
-            self._add_comment_to_table(table, comment)
-        
+            self._add_comment_to_table(table, comment, depth=0)
+
         return table
-    
-    def _add_comment_to_table(self, table: Table, comment: Comment) -> None:
-        """Add comment to table (only tier 1 based on max_tier config)."""
+
+    def _add_comment_to_table(self, table: Table, comment: Comment, depth: int = 0) -> None:
+        """Add comment and its children to table, one row each with indented replies."""
         max_tier = self.config.get('monitor', {}).get('max_tier', 999)
-        
-        # Only show comments within max_tier
+
         if comment.tier > max_tier:
             return
-        
+
         color = self._get_tier_color(comment)
-        new_badge = " [bright_green bold]●[/bright_green bold]" if comment.is_new else ""
-        
-        # Format tier badge
-        tier_badge = f"[{color}]T{comment.tier}[/{color}]{new_badge}"
-        
-        # Format author
-        author = f"[bold {color}]{comment.author}[/bold {color}]"
-        
-        # Format message (truncate if too long)
-        max_length = 60
-        message = comment.message
+        new_dot = " [bright_green bold]●[/bright_green bold]" if comment.is_new else ""
+
+        # Tier badge (compact)
+        tier_badge = f"[{color}]T{comment.tier}[/{color}]{new_dot}"
+
+        # Author with indentation showing reply hierarchy
+        indent = "  " * depth
+        prefix = "└ " if depth > 0 else ""
+        author = f"[bold {color}]{indent}{prefix}{comment.author}[/bold {color}]"
+
+        # Message — truncate to keep row single-line
+        max_length = self.display_config.get('max_message_length', 80)
+        message = comment.message.replace("\n", " ")
         if len(message) > max_length:
-            message = message[:max_length] + "..."
-        
-        # Format time
+            message = message[:max_length] + "…"
+
+        # Time
         time_str = self._format_time(comment.created_time)
-        
+
         table.add_row(tier_badge, author, message, time_str)
+
+        # Recurse into children
+        for child in comment.children:
+            if child.tier <= max_tier:
+                self._add_comment_to_table(table, child, depth + 1)
     
     def _add_comment_to_tree(self, parent_tree: Tree, comment: Comment) -> None:
         """Recursively add comment to tree."""
@@ -197,8 +206,9 @@ class CLIRenderer:
         """Update display with new data."""
         self.post_info = post_info
         self.comments = comments
+        logger.debug(f"Display updated: {len(comments)} comments")
         
-        # Clear screen and print (allows scrolling)
+        # Clear and print updated layout
         self.console.clear()
         self.console.print(self.create_layout())
     
@@ -206,8 +216,9 @@ class CLIRenderer:
         """Start live display."""
         self.post_info = post_info
         self.comments = comments
+        logger.info(f"Live display started: {len(comments)} comments")
         
-        # Initial display
+        # Print initial layout
         self.console.clear()
         self.console.print(self.create_layout())
     
@@ -221,11 +232,6 @@ class CLIRenderer:
         if not self.config['monitor']['enable_notifications']:
             return
         
-        # Temporarily stop live display
-        was_live = self.live is not None
-        if was_live:
-            self.stop_live_display()
-        
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold cyan")
         table.add_column(style="white")
@@ -235,28 +241,12 @@ class CLIRenderer:
         table.add_row("Time:", comment.created_time.strftime("%Y-%m-%d %H:%M:%S"))
         table.add_row("Message:", comment.message[:200])
         
-        panel = Panel(
-            table,
-            title="[bold bright_green]🔔 NEW COMMENT DETECTED[/bold bright_green]",
-            border_style="bright_green",
-            box=box.DOUBLE
-        )
-        
-        self.console.print(panel)
-        
-        # Restart live display
-        if was_live:
-            self.start_live_display(self.post_info, self.comments)
+        logger.info(f"NEW COMMENT DETECTED: {comment.author} (T{comment.tier}) - {comment.message[:100]}")
     
     def show_notification_new_reply(self, comment: Comment) -> None:
         """Show notification for new reply."""
         if not self.config['monitor']['enable_notifications']:
             return
-        
-        # Temporarily stop live display
-        was_live = self.live is not None
-        if was_live:
-            self.stop_live_display()
         
         table = Table.grid(padding=(0, 2))
         table.add_column(style="bold cyan")
@@ -268,34 +258,24 @@ class CLIRenderer:
         table.add_row("Time:", comment.created_time.strftime("%Y-%m-%d %H:%M:%S"))
         table.add_row("Message:", comment.message[:200])
         
-        panel = Panel(
-            table,
-            title="[bold bright_cyan]🔔 NEW REPLY DETECTED[/bold bright_cyan]",
-            border_style="bright_cyan",
-            box=box.DOUBLE
-        )
-        
-        self.console.print(panel)
-        
-        # Restart live display
-        if was_live:
-            self.start_live_display(self.post_info, self.comments)
+        logger.info(f"NEW REPLY DETECTED: {comment.author} (T{comment.tier}) - {comment.message[:100]}")
+
     
     def show_error(self, message: str) -> None:
         """Show error message."""
-        self.console.print(f"[bold red]❌ Error:[/bold red] {message}")
+        logger.error(f"Error: {message}")
     
     def show_success(self, message: str) -> None:
         """Show success message."""
-        self.console.print(f"[bold green]✅ Success:[/bold green] {message}")
+        logger.info(f"Success: {message}")
     
     def show_info(self, message: str) -> None:
         """Show info message."""
-        self.console.print(f"[bold cyan]ℹ️  Info:[/bold cyan] {message}")
+        logger.info(f"Info: {message}")
     
     def show_warning(self, message: str) -> None:
         """Show warning message."""
-        self.console.print(f"[bold yellow]⚠️  Warning:[/bold yellow] {message}")
+        logger.warning(f"Warning: {message}")
     
     def prompt_input(self, message: str) -> str:
         """Prompt user for input."""

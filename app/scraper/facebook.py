@@ -248,7 +248,7 @@ class FacebookScraper:
         except Exception as e:
             logger.debug(f"Failed to take screenshot: {e}")
     
-    async def expand_all_comments(self) -> None:
+    async def expand_all_comments(self, max_tier: int = 999) -> None:
         """Expand all comments and replies."""
         try:
             # Click "View more comments" buttons
@@ -274,6 +274,11 @@ class FacebookScraper:
                         
                 except Exception:
                     break
+            
+            # Skip expanding replies if max_tier is 1 (main comments only)
+            if max_tier < 2:
+                logger.info(f"Skipping reply expansion (max_tier={max_tier})")
+                return
             
             # Click "View more replies" buttons
             while True:

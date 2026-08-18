@@ -14,70 +14,100 @@ logger = logging.getLogger(__name__)
 class FacebookParser:
     """Parse Facebook comments from page."""
     
-    def __init__(self, page: Page):
+    def __init__(self, page: Page, max_tier: int = 999, max_comments: int = 0):
         self.page = page
+        self.max_tier = max_tier
+        self.max_comments = max_comments
     
     async def parse_comments(self) -> List[Comment]:
         """Parse all comments from the current page."""
         try:
             now = datetime.now()
-            
+
             # Get page content
             content = await self.page.content()
             soup = BeautifulSoup(content, 'html.parser')
-            
+
             # Debug: Save full page HTML
             from pathlib import Path
             debug_file = Path("debug_full_page.html")
             debug_file.write_text(content, encoding='utf-8')
             logger.info(f"Saved full page HTML to {debug_file}")
-            
-            # Find all comment containers by looking for links with comment_id
+
+            # Each comment timestamp link has:
+            #   - Top-level:  ?comment_id=XXX
+            #   - Reply:      ?comment_id=PARENT_ID&reply_comment_id=REPLY_ID
             comment_links = soup.find_all('a', href=lambda x: x and 'comment_id=' in x)
-            logger.info(f"Found {len(comment_links)} potential comment elements")
-            
-            # Debug: Print first few hrefs
-            for i, link in enumerate(comment_links[:5]):
-                href = link.get('href', '')
-                logger.info(f"Comment link {i}: {href[:100]}")
-            
-            # Build a map of comments
+            logger.info(f"Found {len(comment_links)} comment links")
+
             comment_map: Dict[str, Comment] = {}
-            
-            for display_order, comment_link in enumerate(comment_links):
+            display_order = 0
+            t1_count = 0
+
+            for comment_link in comment_links:
+                # Check limit BEFORE processing - stop when we have enough T1 comments
+                if self.max_comments > 0 and t1_count >= self.max_comments:
+                    logger.info(f"Reached max_comments limit ({self.max_comments}), stopping parse")
+                    break
+                
                 try:
-                    # Extract comment ID from link
-                    match = re.search(r'comment_id=(\d+)', comment_link.get('href', ''))
-                    if not match:
+                    href = comment_link.get('href', '')
+                    reply_match = re.search(r'reply_comment_id=(\d+)', href)
+                    parent_match = re.search(r'comment_id=(\d+)', href)
+
+                    if reply_match:
+                        # This is a reply — use reply_comment_id as the real ID
+                        comment_id = reply_match.group(1)
+                        parent_id = parent_match.group(1) if parent_match else None
+                        tier = 2
+                    elif parent_match:
+                        comment_id = parent_match.group(1)
+                        parent_id = None
+                        tier = 1
+                    else:
                         continue
-                    
-                    comment_id = match.group(1)
-                    logger.debug(f"Processing comment ID: {comment_id} (order: {display_order})")
-                    
-                    # Find the comment container (traverse up to find containing div)
+
+                    # Skip comments beyond max_tier
+                    if tier > self.max_tier:
+                        continue
+
+                    if comment_id in comment_map:
+                        continue  # already parsed
+
                     container = self._find_comment_container(comment_link)
                     if not container:
                         logger.debug(f"No container found for comment {comment_id}")
                         continue
-                    
-                    # Extract comment data with display order
-                    comment_data = self._parse_comment_from_soup(container, comment_id, comment_link, now, display_order)
+
+                    comment_data = self._parse_comment_from_soup(
+                        container, comment_id, comment_link, now, display_order, parent_id, tier
+                    )
                     if comment_data:
                         comment_map[comment_id] = comment_data
-                        logger.info(f"Parsed comment {comment_id} (order {display_order}): {comment_data.author} - {comment_data.message[:50]}")
-                    else:
-                        logger.debug(f"Failed to parse comment data for {comment_id}")
-                        
+                        display_order += 1
+                        if tier == 1:
+                            t1_count += 1
+                        logger.info(
+                            f"Parsed T{tier} {comment_id} (parent={parent_id}): "
+                            f"{comment_data.author} - {comment_data.message[:50]}"
+                        )
+
                 except Exception as e:
                     logger.debug(f"Failed to parse comment: {e}")
                     continue
-            
-            # Build tree structure (for now, all are root comments)
-            root_comments = list(comment_map.values())
-            
-            logger.info(f"Parsed {len(root_comments)} comments")
+
+            # Build tree: attach replies to their parent comments
+            root_comments: List[Comment] = []
+            for comment in comment_map.values():
+                if comment.parent_id and comment.parent_id in comment_map:
+                    comment_map[comment.parent_id].children.append(comment)
+                else:
+                    root_comments.append(comment)
+
+            logger.info(f"Parsed {len(root_comments)} top-level comments, "
+                        f"{len(comment_map) - len(root_comments)} replies")
             return root_comments
-            
+
         except Exception as e:
             logger.error(f"Error parsing comments: {e}")
             return []
@@ -99,69 +129,87 @@ class FacebookParser:
                     text_len = len(current.get_text())
                     # Make sure it's not too large (not the whole page)
                     if text_len < 2000:
-                        return current
+                        # CRITICAL: This container must contain EXACTLY ONE comment
+                        # Count unique comment_id values (excluding reply_comment_id)
+                        nested_links = current.find_all('a', href=lambda x: x and 'comment_id=' in x)
+                        unique_comment_ids = set()
+                        for link in nested_links:
+                            href = link.get('href', '')
+                            # Extract the main comment_id (not reply_comment_id)
+                            if 'reply_comment_id=' in href:
+                                match = re.search(r'reply_comment_id=(\d+)', href)
+                            else:
+                                match = re.search(r'comment_id=(\d+)', href)
+                            if match:
+                                unique_comment_ids.add(match.group(1))
+                        
+                        # Accept only if this container has exactly ONE comment ID
+                        if len(unique_comment_ids) == 1:
+                            return current
                         
             current = current.parent
             depth += 1
         
         return None
     
-    def _parse_comment_from_soup(self, container, comment_id: str, time_link, now: datetime, display_order: int = 0) -> Optional[Comment]:
+    def _parse_comment_from_soup(
+        self,
+        container,
+        comment_id: str,
+        time_link,
+        now: datetime,
+        display_order: int = 0,
+        parent_id: Optional[str] = None,
+        tier: int = 1,
+    ) -> Optional[Comment]:
         """Parse comment data from BeautifulSoup element."""
         try:
-            # Extract author - find link with /user/ that's not a status indicator
+            # Extract author — first /user/ link with meaningful text
             author = None
-            author_links = container.find_all('a', href=lambda x: x and '/user/' in x)
-            logger.debug(f"Comment {comment_id}: Found {len(author_links)} author links")
-            
-            for link in author_links:
+            for link in container.find_all('a', href=lambda x: x and '/user/' in x):
                 text = link.get_text().strip()
-                logger.debug(f"Comment {comment_id}: Author link text: '{text}'")
                 if text and len(text) > 2 and 'ตัวบ่งชี้' not in text and 'สถานะ' not in text:
                     author = text
                     break
-            
+
             if not author:
                 logger.debug(f"Comment {comment_id}: No author found")
                 return None
-            
-            logger.info(f"Comment {comment_id}: Author = {author}")
-            
-            # Extract message - find div with dir="auto" that's not author name or timestamp
+
+            # Extract message — first dir=auto div whose text is not the author name
+            # and not a pure timestamp word
             message = None
-            message_divs = container.find_all('div', dir='auto')
-            logger.debug(f"Comment {comment_id}: Found {len(message_divs)} div[dir=auto]")
-            
-            for div in message_divs:
+            time_words = re.compile(r'^(\d+\s*)?(ชั่วโมง|นาที|วินาที|วัน|สัปดาห์|[smhdw]|just now|เมื่อสักครู่)')
+            for div in container.find_all('div', dir='auto'):
                 text = div.get_text().strip()
-                logger.debug(f"Comment {comment_id}: Checking message div: '{text[:50]}'")
-                if text and text != author and 'ชั่วโมง' not in text and 'นาที' not in text and 'วินาที' not in text:
+                if text and text != author and not time_words.match(text):
                     message = text
                     break
-            
+
             if not message:
                 logger.debug(f"Comment {comment_id}: No message found")
                 return None
-            
-            logger.info(f"Comment {comment_id}: Message = {message[:50]}")
-            
-            # Extract timestamp
+
+            logger.info(f"Comment {comment_id} T{tier}: {author} — {message[:60]}")
+
             time_text = time_link.get_text().strip()
+            logger.debug(f"Comment {comment_id}: time_text = '{time_text}'")
             created_time = self._parse_relative_time(time_text, now) or now
-            
+            logger.debug(f"Comment {comment_id}: parsed created_time = {created_time}")
+
             return Comment(
                 id=comment_id,
-                parent_id=None,
-                tier=1,
+                parent_id=parent_id,
+                tier=tier,
                 author=author,
                 message=message,
                 created_time=created_time,
                 last_seen=now,
                 display_order=display_order,
                 is_new=False,
-                children=[]
+                children=[],
             )
-            
+
         except Exception as e:
             logger.debug(f"Error parsing comment from soup: {e}")
             return None
