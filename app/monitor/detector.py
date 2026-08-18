@@ -28,6 +28,7 @@ class CommentDetector:
         self.cache = CommentCache()
         self.max_tier = config.get('monitor', {}).get('max_tier', 999)
         self.max_comments = config.get('monitor', {}).get('max_comments', 0)
+        self.display_limit = config.get('monitor', {}).get('display_limit', 10)
         self.parser = FacebookParser(scraper.page, max_tier=self.max_tier, max_comments=self.max_comments)
         self.is_running = False
         self.post_info: Optional[PostInfo] = None
@@ -47,11 +48,14 @@ class CommentDetector:
             # Get sorting mode from config
             sorting_mode = self.config.get('monitor', {}).get('sorting_mode', 'most_recent')
             
-            # Switch to configured sorting view
-            if sorting_mode == "most_recent":
-                await self.scraper.switch_to_most_recent()
+            # Switch to configured sorting view (skip if 'none')
+            if sorting_mode and sorting_mode != "none":
+                if sorting_mode == "most_recent":
+                    await self.scraper.switch_to_most_recent()
+                else:
+                    await self.scraper.switch_sorting_mode(sorting_mode)
             else:
-                await self.scraper.switch_sorting_mode(sorting_mode)
+                logger.info("Skipping sorting mode change (sorting_mode='none')")
             
             # Get post info
             self.post_info = await self.database.get_post_info(post_url)
@@ -78,6 +82,16 @@ class CommentDetector:
         try:
             if not self.is_running or not self.post_info:
                 return []
+            
+            # Check if force_refresh_mode is enabled
+            force_refresh = self.config.get('monitor', {}).get('force_refresh_mode', False)
+            if force_refresh:
+                logger.info("Force refresh mode enabled - toggling sorting to refresh")
+                await self.scraper.force_refresh_comments()
+                # Wait a bit and scroll to ensure comments are loaded
+                await self.scraper.page.wait_for_timeout(200)
+                await self.scraper.page.evaluate("window.scrollBy(0, 200)")
+                await self.scraper.page.wait_for_timeout(100)
             
             # Expand all comments
             await self.scraper.expand_all_comments(max_tier=self.max_tier)
@@ -130,10 +144,26 @@ class CommentDetector:
         refresh_interval_ms = self.config['monitor']['refresh_interval']
         refresh_interval = refresh_interval_ms / 1000.0
         
+        # Start background refresh task
+        refresh_task = None
+        last_refresh_time = 0
+        
         while self.is_running:
             try:
-                await self.refresh_comments()
-                await asyncio.sleep(refresh_interval)
+                current_time = asyncio.get_event_loop().time()
+                
+                # Start new refresh task if enough time has passed and no task is running
+                if (refresh_task is None or refresh_task.done()) and (current_time - last_refresh_time) >= refresh_interval:
+                    refresh_task = asyncio.create_task(self.refresh_comments())
+                    last_refresh_time = current_time
+                
+                # Update CLI every 1 second regardless of refresh status
+                if self.on_refresh:
+                    comments = await self.database.get_comments(self.post_info.url, limit=self.display_limit)
+                    await self.on_refresh(comments, 0, 0)
+                
+                await asyncio.sleep(1.0)  # Fixed 1 second CLI update
+                
             except KeyboardInterrupt:
                 # User pressed Ctrl+C - stop monitoring
                 logger.info("Monitoring stopped by user")
@@ -141,7 +171,7 @@ class CommentDetector:
                 raise  # Re-raise to propagate to main()
             except Exception as e:
                 logger.error(f"Error in monitor loop: {e}")
-                await asyncio.sleep(refresh_interval)
+                await asyncio.sleep(1.0)
     
     def stop_monitoring(self) -> None:
         """Stop monitoring."""

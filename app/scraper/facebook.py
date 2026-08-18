@@ -119,19 +119,25 @@ class FacebookScraper:
         try:
             logger.info(f"Navigating to post: {url}")
             await self.page.goto(url, wait_until="domcontentloaded")
-            await self.page.wait_for_timeout(3000)
             
-            # Scroll down to load comments
-            logger.info("Scrolling to load all comments...")
-            await self.page.evaluate("""
-                async () => {
-                    const scrollHeight = document.body.scrollHeight;
-                    window.scrollTo(0, scrollHeight);
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+            # Get scroll_times from config for initial load
+            scroll_times = self.config.get('monitor', {}).get('scroll_times', 2)
+            wait_time = 500 if scroll_times <= 2 else 1000  # Shorter wait for fewer scrolls
+            
+            await self.page.wait_for_timeout(wait_time)
+            
+            # Scroll down to load comments (use config scroll_times)
+            logger.info(f"Initial scroll ({scroll_times} times) to load comments...")
+            await self.page.evaluate(f"""
+                async () => {{
+                    for (let i = 0; i < {scroll_times}; i++) {{
+                        window.scrollBy(0, 1000);
+                        await new Promise(resolve => setTimeout(resolve, {wait_time}));
+                    }}
                     window.scrollTo(0, 0);
-                }
+                }}
             """)
-            await self.page.wait_for_timeout(2000)
+            await self.page.wait_for_timeout(500)
             
             # Take screenshot after initial load
             await self._take_screenshot("01_after_navigation")
@@ -195,7 +201,7 @@ class FacebookScraper:
             # Click sorting button
             await sorting_button.scroll_into_view_if_needed()
             await sorting_button.click()
-            await self.page.wait_for_timeout(1000)
+            await self.page.wait_for_timeout(300)
             await self._take_screenshot("03_sorting_menu_opened")
             
             # Click target sorting option
@@ -232,6 +238,42 @@ class FacebookScraper:
         except Exception as e:
             logger.error(f"Error switching to most recent: {e}")
             await self._take_screenshot("06_switch_error")
+            return False
+    
+    async def force_refresh_comments(self) -> bool:
+        """
+        Force refresh comments by toggling sorting mode.
+        Switches to 'all' mode then back to 'most_recent' to force Facebook to reload comments.
+        """
+        try:
+            logger.info("Force refreshing comments by toggling sorting mode...")
+            
+            # Switch to "all comments" mode
+            success = await self.switch_sorting_mode("all")
+            if not success:
+                logger.warning("Failed to switch to 'all' mode, trying alternative method...")
+                # Try most_relevant as alternative
+                success = await self.switch_sorting_mode("most_relevant")
+            
+            await self.page.wait_for_timeout(200)
+            
+            # Scroll slightly to trigger content load
+            await self.page.evaluate("window.scrollBy(0, 100)")
+            await self.page.wait_for_timeout(100)
+            
+            # Switch back to "most recent" mode
+            await self.switch_sorting_mode("most_recent")
+            await self.page.wait_for_timeout(200)
+            
+            # Scroll slightly again to trigger content load
+            await self.page.evaluate("window.scrollBy(0, 100)")
+            await self.page.wait_for_timeout(100)
+            
+            logger.info("Force refresh completed - comments should be updated")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error during force refresh: {e}")
             return False
     
     async def _take_screenshot(self, name: str) -> None:
@@ -312,9 +354,12 @@ class FacebookScraper:
     async def get_raw_comments_html(self) -> str:
         """Get raw HTML of comments section."""
         try:
+            # Get scroll_times from config (default to 5 for backward compatibility)
+            scroll_times = self.config.get('monitor', {}).get('scroll_times', 5)
+            
             # Scroll down multiple times to load more comments
-            logger.info("Scrolling to load all comments...")
-            for i in range(5):
+            logger.info(f"Scrolling {scroll_times} times to load comments...")
+            for i in range(scroll_times):
                 await self.page.evaluate("window.scrollBy(0, 1000)")
                 await self.page.wait_for_timeout(1000)
             

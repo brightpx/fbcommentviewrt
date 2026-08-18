@@ -106,17 +106,18 @@ class CommentDatabase:
         await self.conn.commit()
         logger.debug(f"Saved {len(comments)} comments to database")
     
-    async def get_comments(self, post_url: str) -> List[Comment]:
+    async def get_comments(self, post_url: str, limit: int = 0) -> List[Comment]:
         """Get all comments for a post."""
-        cursor = await self.conn.execute(
-            """
+        query = """
             SELECT id, parent_id, tier, author, message, created_time, last_seen, display_order, is_deleted
             FROM comments
             WHERE post_url = ? AND is_deleted = 0
             ORDER BY display_order ASC
-            """,
-            (post_url,)
-        )
+            """
+        if limit > 0:
+            query += f" LIMIT {limit}"
+        
+        cursor = await self.conn.execute(query, (post_url,))
         
         rows = await cursor.fetchall()
         comments = []

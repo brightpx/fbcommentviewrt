@@ -179,8 +179,10 @@ class FacebookParser:
             # Extract message — first dir=auto div whose text is not the author name
             # and not a pure timestamp word
             message = None
-            time_words = re.compile(r'^(\d+\s*)?(ชั่วโมง|นาที|วินาที|วัน|สัปดาห์|[smhdw]|just now|เมื่อสักครู่)')
-            for div in container.find_all('div', dir='auto'):
+            time_words = re.compile(r'^(\d+\s*)?(ชั่วโมง|นาที|วินาที|วัน|สัปดาห์|just now|เมื่อสักครู่)$|^(\d+\s*[smhdw])\b', re.IGNORECASE)
+            
+            auto_divs = container.find_all('div', dir='auto')
+            for div in auto_divs:
                 text = div.get_text().strip()
                 if text and text != author and not time_words.match(text):
                     message = text

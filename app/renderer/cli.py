@@ -52,8 +52,8 @@ class CLIRenderer:
         """Create comment table view (one row per comment, with nested replies indented)."""
         display_limit = self.config.get('monitor', {}).get('display_limit', 50)
 
-        # Sort by display_order ascending (display_order=0 is newest comment from Facebook)
-        sorted_comments = sorted(self.comments, key=lambda c: c.display_order, reverse=False)
+        # Sort by created_time descending (newest comment first)
+        sorted_comments = sorted(self.comments, key=lambda c: c.created_time, reverse=True)
 
         if display_limit == 0:
             title = f"Comments (showing all {len(sorted_comments)})"
@@ -71,10 +71,10 @@ class CLIRenderer:
             padding=(0, 1),
             show_lines=False,
         )
-        table.add_column("Tier", width=5, no_wrap=True)
-        table.add_column("Author", width=22, no_wrap=True)
-        table.add_column("Message", min_width=40, ratio=1)
-        table.add_column("Time", width=20, no_wrap=True, style="dim")
+        table.add_column("Tier", width=4, no_wrap=True)
+        table.add_column("Author", width=20, no_wrap=True)
+        table.add_column("Message", min_width=30, ratio=1)
+        table.add_column("Time", width=25, no_wrap=True, style="dim")
 
         if not self.comments:
             table.add_row("", "", "[dim]No comments yet...[/dim]", "")

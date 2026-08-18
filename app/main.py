@@ -173,12 +173,12 @@ class FacebookCommentMonitor:
         """Callback for new reply."""
         self.renderer.show_notification_new_reply(comment)
     
-    async def _on_refresh(self, comments: list, new_count: int, updated_count: int) -> None:
+    async def _on_refresh(self, comments: list, post_info) -> None:
         """Callback for refresh."""
-        logger.info(f"_on_refresh called with {len(comments)} comments, new={new_count}, updated={updated_count}")
-        if self.detector.post_info:
+        logger.info(f"_on_refresh called with {len(comments)} comments")
+        if post_info:
             logger.info("Calling renderer.update_display...")
-            self.renderer.update_display(self.detector.post_info, comments)
+            self.renderer.update_display(post_info, comments)
             logger.info("renderer.update_display completed")
     
     async def start_monitoring(self, post_url: str) -> None:
