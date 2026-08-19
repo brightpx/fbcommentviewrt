@@ -56,6 +56,7 @@ class OptimizedFacebookAutoReply:
         
         self.scraper: Optional[FacebookScraper] = None
         self.detector: Optional[OwnerCommentDetector] = None
+        self.db = None  # Will be initialized in initialize()
         
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from YAML file."""
@@ -77,54 +78,59 @@ class OptimizedFacebookAutoReply:
         """Initialize browser and detector."""
         try:
             logger.info("=" * 60)
-            logger.info("🚀 OPTIMIZED FACEBOOK AUTO-REPLY STARTING")
+            logger.info("OPTIMIZED FACEBOOK AUTO-REPLY STARTING")
             logger.info("=" * 60)
             
             print("\n" + "=" * 60)
-            print("🚀 OPTIMIZED FACEBOOK AUTO-REPLY")
+            print("OPTIMIZED FACEBOOK AUTO-REPLY")
             print("=" * 60)
-            print("📊 Performance Target:")
-            print("   • Detection: 50-100ms (10x faster)")
-            print("   • Reply: 100-200ms (5x faster)")
-            print("   • CPU: 80% lower usage")
-            print("   • Memory: 60% lower usage")
+            print("Performance Target:")
+            print("   - Detection: 50-100ms (10x faster)")
+            print("   - Reply: 100-200ms (5x faster)")
+            print("   - CPU: 80% lower usage")
+            print("   - Memory: 60% lower usage")
             print("=" * 60 + "\n")
             
             # Initialize scraper
-            print("🌐 Initializing browser...")
+            print("Initializing browser...")
             self.scraper = FacebookScraper(self.config)
             await self.scraper.initialize()
-            print("✓ Browser initialized\n")
+            print("OK Browser initialized\n")
             
             # Get post URL
             post_url = self.config.get('target', {}).get('post_url', '')
             if not post_url or post_url == "https://www.facebook.com/groups/YOUR_GROUP_ID/posts/YOUR_POST_ID/":
-                print("❌ ERROR: No valid post_url in config.yaml")
+                print("ERROR: No valid post_url in config.yaml")
                 logger.error("No valid post_url configured")
                 return False
             
             # Check login
-            print("🔐 Checking Facebook login...")
+            print("Checking Facebook login...")
             is_logged_in = await self.scraper.is_logged_in()
             
             if not is_logged_in:
-                print("⚠️  Not logged in - please login in browser window...")
+                print("WARNING: Not logged in - please login in browser window...")
                 if not await self.scraper.login():
-                    print("❌ Login failed")
+                    print("ERROR: Login failed")
                     return False
-                print("✓ Login successful\n")
+                print("OK Login successful\n")
             else:
-                print("✓ Already logged in\n")
+                print("OK Already logged in\n")
             
             # Initialize owner detector
-            print("🎯 Initializing owner comment detector...")
+            print("Initializing owner comment detector...")
             self.detector = OwnerCommentDetector(self.scraper, self.config)
             
             if not await self.detector.initialize(post_url):
-                print("❌ Failed to initialize detector")
+                print("ERROR: Failed to initialize detector")
                 return False
             
-            print(f"✓ Detector initialized")
+            # Setup callback for auto-reply
+            if self.config.get('auto_reply', {}).get('enabled', False):
+                self.detector.on_owner_comment = self._handle_owner_comment
+                logger.info("Auto-reply callback registered")
+            
+            print(f"OK Detector initialized")
             print(f"   Owner: {self.detector.owner_name}")
             print(f"   Tracking: {len(self.detector.known_comment_ids)} existing comments")
             print()
@@ -134,8 +140,8 @@ class OptimizedFacebookAutoReply:
             reply_message = self.config.get('auto_reply', {}).get('reply_message', '')
             refresh_interval = self.config.get('monitor', {}).get('refresh_interval', 200)
             
-            print("⚙️  Configuration:")
-            print(f"   Auto-reply: {'ENABLED ✓' if auto_reply_enabled else 'DISABLED ✗'}")
+            print("Configuration:")
+            print(f"   Auto-reply: {'ENABLED' if auto_reply_enabled else 'DISABLED'}")
             if auto_reply_enabled:
                 print(f"   Reply message: {reply_message[:50]}...")
             print(f"   Refresh interval: {refresh_interval}ms")
@@ -143,12 +149,12 @@ class OptimizedFacebookAutoReply:
             print(f"   Reply mode: Direct DOM injection")
             print()
             
-            logger.info("✓ All components initialized successfully")
+            logger.info("OK All components initialized successfully")
             return True
             
         except Exception as e:
             logger.error(f"Initialization failed: {e}", exc_info=True)
-            print(f"❌ Initialization failed: {e}")
+            print(f"ERROR: Initialization failed: {e}")
             return False
     
     async def run(self) -> None:
@@ -159,25 +165,25 @@ class OptimizedFacebookAutoReply:
         
         try:
             print("=" * 60)
-            print("🎯 MONITORING STARTED")
+            print("MONITORING STARTED")
             print("=" * 60)
             print("Waiting for owner comments...")
             print("Press Ctrl+C to stop")
             print("=" * 60 + "\n")
             
-            logger.info("🎯 Starting owner comment monitoring")
+            logger.info("Starting owner comment monitoring")
             
             # Run the optimized monitor loop
             await self.detector.monitor_loop()
             
         except KeyboardInterrupt:
             print("\n\n" + "=" * 60)
-            print("🛑 MONITORING STOPPED BY USER")
+            print("MONITORING STOPPED BY USER")
             print("=" * 60)
             
             # Show statistics
             stats = self.detector.get_stats()
-            print(f"\n📊 Performance Statistics:")
+            print(f"\nPerformance Statistics:")
             print(f"   Total scans: {stats['total_scans']}")
             print(f"   Owner comments detected: {stats['owner_comments_detected']}")
             print(f"   Replies posted: {stats['replies_posted']}")
@@ -191,10 +197,59 @@ class OptimizedFacebookAutoReply:
             
         except Exception as e:
             logger.error(f"Error in monitoring: {e}", exc_info=True)
-            print(f"\n❌ Error: {e}\n")
+            print(f"\nERROR: {e}\n")
             
         finally:
             await self.cleanup()
+    
+    async def _handle_owner_comment(self, comment: dict) -> None:
+        """Handle detected owner comment - post auto-reply."""
+        try:
+            comment_id = comment.get('comment_id', 'unknown')
+            author = comment.get('author', 'unknown')
+            text = comment.get('text', '')
+            
+            logger.info(f"CALLBACK: Handling owner comment {comment_id}")
+            logger.info(f"   Author: {author}")
+            logger.info(f"   Text: {text[:100]}")
+            
+            # Check if auto-reply enabled
+            if not self.config.get('auto_reply', {}).get('enabled', False):
+                logger.info("Auto-reply disabled - skipping reply")
+                return
+            
+            # Get reply message
+            reply_message = self.config.get('auto_reply', {}).get('reply_message', '')
+            if not reply_message:
+                logger.warning("No reply message configured - skipping reply")
+                return
+            
+            logger.info(f"Posting reply: {reply_message[:50]}...")
+            
+            # Post reply using scraper
+            success = await self.scraper.reply_to_comment(comment_id, reply_message)
+            
+            if success:
+                logger.info(f"SUCCESS: Reply posted to comment {comment_id}")
+                
+                # Save to database
+                try:
+                    await self.db.add_comment(
+                        comment_id=comment_id,
+                        post_url=self.config.get('target', {}).get('post_url', ''),
+                        author=author,
+                        text=text,
+                        is_owner=True,
+                        replied=True
+                    )
+                    logger.info(f"Comment {comment_id} saved to database")
+                except Exception as db_error:
+                    logger.error(f"Failed to save to database: {db_error}")
+            else:
+                logger.error(f"FAILED: Could not post reply to comment {comment_id}")
+                
+        except Exception as e:
+            logger.error(f"Error in _handle_owner_comment: {e}", exc_info=True)
     
     async def cleanup(self) -> None:
         """Cleanup resources."""

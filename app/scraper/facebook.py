@@ -782,13 +782,13 @@ class FacebookScraper:
                     is_correct_page = expected_url in current_url
             
             if not is_correct_page and expected_url:
-                print(f"[DEBUG] ⚠ Page redirected! Current: {current_url}")
+                print(f"[DEBUG] WARNING Page redirected! Current: {current_url}")
                 print(f"[DEBUG] Expected: {expected_url}")
                 print("[DEBUG] Navigating back to post immediately...")
                 logger.warning(f"Page redirected after posting comment. Current: {current_url}, Expected: {expected_url}")
                 await self.page.goto(expected_url, wait_until="domcontentloaded")
                 await self.page.wait_for_timeout(self.config['browser']['timings']['sorting_mode_switch'])
-                print("[DEBUG] ✓ Navigated back to post")
+                print("[DEBUG] OK Navigated back to post")
                 logger.info("Successfully navigated back to post page")
             
             # Now wait to ensure comment appears

@@ -246,7 +246,7 @@ class CommentDetector:
                 logger.info(f"Auto reply triggered for post owner's comment by {comment.author}")
                 logger.info(f"Comment ID: {comment.id}")
                 logger.info(f"Comment: {comment.message[:50]}...")
-                print(f"[DEBUG] ✓ AUTO REPLY TRIGGERED for comment {comment.id}")
+                print(f"[DEBUG] OK AUTO REPLY TRIGGERED for comment {comment.id}")
                 
                 # Post reply using the new reply_to_comment function
                 success = await self.scraper.reply_to_comment(comment.id, reply_message)
@@ -259,14 +259,14 @@ class CommentDetector:
                     comment.response_time = time_diff
                     
                     logger.info(f"Auto reply posted successfully to comment {comment.id}")
-                    print(f"[DEBUG] ⏰ Reply posted at: {reply_time.strftime('%H:%M:%S.%f')[:-3]}")
-                    print(f"[DEBUG] ⚡ Response time: {time_diff:.2f} seconds")
-                    print(f"[DEBUG] ✓ Reply posted successfully!")
+                    print(f"[DEBUG] Reply posted at: {reply_time.strftime('%H:%M:%S.%f')[:-3]}")
+                    print(f"[DEBUG] Response time: {time_diff:.2f} seconds")
+                    print(f"[DEBUG] OK Reply posted successfully!")
                 else:
                     logger.error(f"Failed to post auto reply to comment {comment.id}")
-                    print(f"[DEBUG] ✗ Reply failed!")
+                    print(f"[DEBUG] X Reply failed!")
             else:
-                print(f"[DEBUG] ✗ No match - skipping")
+                print(f"[DEBUG] X No match - skipping")
                     
         except Exception as e:
             logger.error(f"Error in auto reply: {e}", exc_info=True)
