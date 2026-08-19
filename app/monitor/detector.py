@@ -59,8 +59,10 @@ class CommentDetector:
             self.post_author_name = await self.scraper.get_post_author()
             if self.post_author_name:
                 logger.info(f"Post author detected: {self.post_author_name}")
+                print(f"[DEBUG] Post author detected: {self.post_author_name}")
             else:
                 logger.warning("Could not detect post author - auto reply may not work")
+                print("[DEBUG] WARNING: Could not detect post author")
             
             # Get sorting mode from config
             sorting_mode = self.config.get('monitor', {}).get('sorting_mode', 'most_recent')
@@ -207,43 +209,68 @@ class CommentDetector:
     
     async def _check_auto_reply(self, comment: Comment) -> None:
         """Check if auto reply should be triggered for this comment."""
+        from datetime import datetime
         try:
             # Check if auto_reply is enabled
             auto_reply_config = self.config.get('auto_reply', {})
             if not auto_reply_config.get('enabled', False):
+                print(f"[DEBUG] Auto reply disabled")
                 return
             
             # Use detected post author (from page) instead of config
             post_owner_name = self.post_author_name
             if not post_owner_name:
                 logger.warning("Auto reply enabled but post author was not detected")
+                print("[DEBUG] WARNING: post author not detected!")
                 return
             
             reply_message = auto_reply_config.get('reply_message', '').strip()
             if not reply_message:
                 logger.warning("Auto reply enabled but reply_message is empty")
+                print("[DEBUG] WARNING: reply_message is empty!")
                 return
             
             reply_tier = auto_reply_config.get('reply_tier', 2)
+            
+            print(f"[DEBUG] Checking comment: tier={comment.tier}, author={comment.author[:30]}, msg={comment.message[:30]}")
+            print(f"[DEBUG] Post owner: {post_owner_name}")
+            print(f"[DEBUG] Match check: tier={comment.tier} == {reply_tier - 1}? author match? {post_owner_name.lower()} in {comment.author.lower()}")
             
             # Check if this comment matches criteria
             # 1. Comment tier must be reply_tier - 1 (e.g., tier 1 for reply_tier 2)
             # 2. Author must be the post owner
             if comment.tier == reply_tier - 1 and post_owner_name.lower() in comment.author.lower():
+                detect_time = datetime.now()
+                print(f"[DEBUG] ⏰ Comment detected at: {detect_time.strftime('%H:%M:%S.%f')[:-3]}")
+                
                 logger.info(f"Auto reply triggered for post owner's comment by {comment.author}")
                 logger.info(f"Comment ID: {comment.id}")
                 logger.info(f"Comment: {comment.message[:50]}...")
+                print(f"[DEBUG] ✓ AUTO REPLY TRIGGERED for comment {comment.id}")
                 
                 # Post reply using the new reply_to_comment function
                 success = await self.scraper.reply_to_comment(comment.id, reply_message)
                 
+                reply_time = datetime.now()
+                time_diff = (reply_time - detect_time).total_seconds()
+                
                 if success:
+                    # Save response time to comment object
+                    comment.response_time = time_diff
+                    
                     logger.info(f"Auto reply posted successfully to comment {comment.id}")
+                    print(f"[DEBUG] ⏰ Reply posted at: {reply_time.strftime('%H:%M:%S.%f')[:-3]}")
+                    print(f"[DEBUG] ⚡ Response time: {time_diff:.2f} seconds")
+                    print(f"[DEBUG] ✓ Reply posted successfully!")
                 else:
                     logger.error(f"Failed to post auto reply to comment {comment.id}")
+                    print(f"[DEBUG] ✗ Reply failed!")
+            else:
+                print(f"[DEBUG] ✗ No match - skipping")
                     
         except Exception as e:
             logger.error(f"Error in auto reply: {e}", exc_info=True)
+            print(f"[DEBUG] ERROR in auto reply: {e}")
     
     def _flatten_comments(self, comments: List[Comment]) -> List[Comment]:
         """Flatten nested comment tree."""

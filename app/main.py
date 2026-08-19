@@ -31,7 +31,7 @@ def setup_logging(config: dict) -> None:
         level=getattr(logging, log_config['level']),
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler(log_config['file'])
+            logging.FileHandler(log_config['file'], encoding='utf-8', errors='replace')
         ]
     )
 
@@ -66,8 +66,6 @@ class FacebookCommentMonitor:
         self.database: Optional[CommentDatabase] = None
         self.detector: Optional[CommentDetector] = None
         self.renderer: Optional[CLIRenderer] = None
-        self.post_comment_requested = False
-        self.keyboard_listener_running = False
         
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from YAML file."""
@@ -190,86 +188,17 @@ class FacebookCommentMonitor:
             self.renderer.update_display(post_info, comments)
             logger.info("renderer.update_display completed")
     
-    def _keyboard_listener_thread(self) -> None:
-        """Thread function to listen for keyboard input (Windows only)."""
-        if not HAS_MSVCRT:
-            return
-        
-        self.keyboard_listener_running = True
-        print("\n[DEBUG] Keyboard listener thread started")
-        logger.info("Keyboard listener started - press 'p' to post comment")
-        
-        while self.keyboard_listener_running:
-            if msvcrt.kbhit():
-                key = msvcrt.getch()
-                print(f"\n[DEBUG] Key pressed: {key}")
-                if key == b'p' or key == b'P':
-                    print("\n[DEBUG] P key detected! Setting flag...")
-                    logger.info("Post comment key pressed")
-                    self.post_comment_requested = True
-            
-            # Small sleep to avoid busy-waiting
-            import time
-            time.sleep(self.config['monitor']['timings']['keyboard_poll_interval'] / 1000.0)
-    
     async def _check_and_post_comment(self) -> None:
-        """Check if comment post is requested and post it."""
-        if not self.post_comment_requested:
-            return
-        
-        from datetime import datetime
-        log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        print(f"\n[DEBUG] Flag detected! post_comment_requested={self.post_comment_requested}")
-        print(f"[DEBUG] Starting comment post process...")
-        logger.info(f"[{log_time}] Manual comment post requested (hotkey 'p' pressed)")
-        self.post_comment_requested = False
-        
-        try:
-            print(f"[DEBUG] Inside try block...")
-            auto_comment_config = self.config.get('auto_comment', {})
-            message = auto_comment_config.get('message', 'TEST_COMMENT_{{timestamp}}')
-            
-            print(f"[DEBUG] Message template: {message}")
-            
-            # Replace {{timestamp}} with actual timestamp
-            from datetime import datetime
-            timestamp = datetime.now().strftime("%H%M%S")
-            message = message.replace('{{timestamp}}', timestamp)
-            
-            print(f"[DEBUG] Final message: {message}")
-            print(f"[DEBUG] Calling show_info...")
-            self.renderer.show_info(f"Posting comment: {message}")
-            print(f"[DEBUG] Calling post_comment...")
-            success = await self.scraper.post_comment(message)
-            print(f"[DEBUG] Post result: {success}")
-            
-            log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            if success:
-                logger.info(f"[{log_time}] Manual comment posted successfully")
-                logger.info(f"[{log_time}] Posted message: {message}")
-                self.renderer.show_success(f"Comment posted: {message}")
-                self.renderer.show_info("Waiting for comment to appear...")
-                await asyncio.sleep(self.config['monitor']['timings']['after_post_success'] / 1000.0)
-                # Force refresh to show new comment immediately
-                comments = await self.detector.refresh_comments()
-                # Update display with new comments
-                self.renderer.start_live_display(self.detector.post_info, comments)
-                self.renderer.show_success("New comment displayed!")
-                await asyncio.sleep(self.config['monitor']['timings']['display_new_comment'] / 1000.0)  # Give user time to see the new comment before next refresh cycle
-            else:
-                logger.error(f"[{log_time}] ✗ Failed to post manual comment")
-                logger.error(f"[{log_time}] Failed message: {message}")
-                self.renderer.show_error("Failed to post comment")
-                
-        except Exception as e:
-            from datetime import datetime
-            log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            logger.error(f"[{log_time}] Error posting comment: {e}", exc_info=True)
-            self.renderer.show_error(f"Comment error: {e}")
+        """Post a test comment (for testing purposes only)."""
+        # This method is kept for potential future manual testing
+        # but is no longer called from the monitoring loop
+        return
     
     async def post_new_comment(self, message: str) -> bool:
         """Post a new comment to Facebook (public API)
+        
+        Opens a separate browser session to post the comment,
+        without interfering with the monitoring session.
         
         Args:
             message: Comment message to post
@@ -281,10 +210,12 @@ class FacebookCommentMonitor:
             from datetime import datetime
             log_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             
-            self.renderer.show_info(f"Posting comment: {message}")
-            logger.info(f"[{log_time}] Posting comment: {message}")
+            self.renderer.show_info(f"Posting comment in separate session: {message}")
+            logger.info(f"[{log_time}] Posting comment in separate session: {message}")
             
-            success = await self.scraper.post_comment(message)
+            # Use separate session method with post URL
+            post_url = self.config['target']['post_url']
+            success = await self.scraper.post_comment_separate_session(message, post_url)
             
             if success:
                 logger.info(f"[{log_time}] Comment posted successfully: {message}")
@@ -319,46 +250,61 @@ class FacebookCommentMonitor:
                 self.renderer.show_error("Failed to start monitoring")
                 return
             
-            # Start keyboard listener thread (Windows only)
-            if HAS_MSVCRT:
-                keyboard_thread = threading.Thread(target=self._keyboard_listener_thread, daemon=True)
-                keyboard_thread.start()
-                self.renderer.show_info("Press 'p' anytime to post a test comment")
-            
             # Initial refresh
             comments = await self.detector.refresh_comments()
             
             # Start live display
             self.renderer.start_live_display(self.detector.post_info, comments)
             
-            # Start monitoring loop with hotkey support
+            # Start monitoring loop
             refresh_interval_ms = self.config['monitor']['refresh_interval']
             refresh_interval = refresh_interval_ms / 1000.0
             
-            while self.detector.is_running:
-                try:
-                    # Check if user pressed 'p' to post comment
-                    await self._check_and_post_comment()
-                    
-                    # Refresh comments and update display
-                    await self.detector.refresh_comments()
-                    
-                    # Sleep for the configured interval before next refresh
-                    await asyncio.sleep(refresh_interval)
-                    
-                except KeyboardInterrupt:
-                    # User pressed Ctrl+C - stop monitoring
-                    logger.info("Monitoring stopped by user")
-                    self.detector.stop_monitoring()
-                    raise  # Re-raise to propagate to main()
-                except Exception as e:
-                    logger.error(f"Error in monitor loop: {e}")
-                    await asyncio.sleep(self.config['monitor']['timings']['error_retry_delay'] / 1000.0)
+            # Keep-alive background task
+            keep_alive_config = self.config['monitor'].get('keep_alive', {})
+            keep_alive_task = None
+            
+            if keep_alive_config.get('enabled', False):
+                async def keep_alive_loop():
+                    interval = keep_alive_config.get('interval', 45)
+                    while self.detector.is_running:
+                        await asyncio.sleep(interval)
+                        if self.detector.is_running:
+                            await self.scraper.keep_alive()
+                
+                keep_alive_task = asyncio.create_task(keep_alive_loop())
+                logger.info(f"Keep-alive enabled: {keep_alive_config.get('interval', 45)}s interval")
+            
+            try:
+                while self.detector.is_running:
+                    try:
+                        
+                        # Refresh comments and update display
+                        await self.detector.refresh_comments()
+                        
+                        # Sleep for the configured interval before next refresh
+                        await asyncio.sleep(refresh_interval)
+                        
+                    except KeyboardInterrupt:
+                        # User pressed Ctrl+C - stop monitoring
+                        logger.info("Monitoring stopped by user")
+                        self.detector.stop_monitoring()
+                        raise  # Re-raise to propagate to main()
+                    except Exception as e:
+                        logger.error(f"Error in monitor loop: {e}")
+                        await asyncio.sleep(self.config['monitor']['timings']['error_retry_delay'] / 1000.0)
+            finally:
+                # Cancel keep-alive task when monitoring stops
+                if keep_alive_task:
+                    keep_alive_task.cancel()
+                    try:
+                        await keep_alive_task
+                    except asyncio.CancelledError:
+                        pass
             
         except KeyboardInterrupt:
             # User pressed Ctrl+C - stop and cleanup
             logger.info("Monitoring interrupted by user")
-            self.keyboard_listener_running = False
             self.renderer.stop_live_display()
             self.renderer.show_info("\n\nMonitoring stopped by user.")
             raise  # Re-raise to exit cleanly
@@ -366,7 +312,6 @@ class FacebookCommentMonitor:
             logger.error(f"Error during monitoring: {e}", exc_info=True)
             self.renderer.show_error(f"Monitoring error: {e}")
         finally:
-            self.keyboard_listener_running = False
             self.renderer.stop_live_display()
     
     async def cleanup(self) -> None:
@@ -430,6 +375,8 @@ async def main():
         pass
     except Exception as e:
         print(f"\n\nFatal error: {e}")
+        import traceback
+        traceback.print_exc()
         sys.exit(1)
 
 

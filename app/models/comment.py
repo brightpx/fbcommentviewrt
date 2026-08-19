@@ -18,6 +18,7 @@ class Comment:
     display_order: int = 0  # Order on Facebook page (0 = most recent)
     is_new: bool = False
     is_deleted: bool = False
+    response_time: Optional[float] = None  # Auto-reply response time in seconds
     children: List['Comment'] = field(default_factory=list)
     
     def to_dict(self) -> dict:
@@ -33,6 +34,7 @@ class Comment:
             'display_order': self.display_order,
             'is_new': self.is_new,
             'is_deleted': self.is_deleted,
+            'response_time': self.response_time,
             'children': [child.to_dict() for child in self.children]
         }
     

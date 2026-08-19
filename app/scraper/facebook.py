@@ -98,6 +98,30 @@ class FacebookScraper:
                 json.dump(session_data, f, indent=2)
             logger.info(f"Session saved to {self.session_file}")
     
+    async def keep_alive(self) -> None:
+        """Keep browser active to prevent Facebook throttling."""
+        if not self.page:
+            return
+        
+        try:
+            # Mouse movement simulation
+            await self.page.mouse.move(100, 100)
+            await asyncio.sleep(0.05)
+            await self.page.mouse.move(200, 200)
+            
+            # Micro scroll (10px down, 10px up)
+            await self.page.evaluate("window.scrollBy(0, 10)")
+            await asyncio.sleep(0.05)
+            await self.page.evaluate("window.scrollBy(0, -10)")
+            
+            # Ensure page is focused
+            await self.page.bring_to_front()
+            
+            logger.debug("Keep-alive: browser activity simulated")
+            
+        except Exception as e:
+            logger.warning(f"Keep-alive action failed: {e}")
+    
     async def is_logged_in(self) -> bool:
         """Check if user is logged in to Facebook."""
         try:
@@ -514,9 +538,148 @@ class FacebookScraper:
             logger.error(f"Error getting comments HTML: {e}")
             return ""
     
+    async def post_comment_separate_session(self, message: str, post_url: str) -> bool:
+        """
+        Post a comment using a separate browser session.
+        This does not interfere with the monitoring session.
+        
+        Args:
+            message: The comment text to post
+            post_url: The Facebook post URL to comment on
+            
+        Returns:
+            True if comment was posted successfully, False otherwise
+        """
+        temp_playwright = None
+        temp_browser = None
+        temp_context = None
+        temp_page = None
+        
+        try:
+            from datetime import datetime
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"[DEBUG] post_comment_separate_session() called")
+            logger.info(f"[{timestamp}] Starting separate session for manual comment")
+            
+            # Create new playwright instance
+            temp_playwright = await async_playwright().start()
+            
+            # Launch new browser with same config
+            browser_config = self.config['browser']
+            temp_browser = await temp_playwright.chromium.launch(
+                headless=browser_config['headless'],
+                slow_mo=browser_config['slow_mo']
+            )
+            
+            # Load session from file
+            if Path(self.session_file).exists():
+                with open(self.session_file, 'r') as f:
+                    session_data = json.load(f)
+                
+                temp_context = await temp_browser.new_context(
+                    storage_state=session_data,
+                    viewport={'width': 1920, 'height': 1080},
+                    user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                )
+            else:
+                logger.error("No session file found - cannot post comment")
+                return False
+            
+            temp_page = await temp_context.new_page()
+            temp_page.set_default_timeout(self.config['browser']['timeout'])
+            
+            # Navigate to post
+            print(f"[DEBUG] Navigating to: {post_url}")
+            logger.info(f"Navigating to post: {post_url}")
+            await temp_page.goto(post_url, wait_until="domcontentloaded")
+            await temp_page.wait_for_timeout(3000)  # Longer wait for page load
+            
+            # Scroll down multiple times to ensure everything loads
+            print("[DEBUG] Scrolling to load comments...")
+            for i in range(3):
+                await temp_page.evaluate("window.scrollBy(0, 800)")
+                await temp_page.wait_for_timeout(800)
+            
+            # Scroll to bottom where comment box should be
+            await temp_page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await temp_page.wait_for_timeout(2000)
+            
+            # Find comment box with longer timeout
+            print("[DEBUG] Finding comment box...")
+            comment_box = None
+            selectors = [
+                'div[contenteditable="true"][role="textbox"]',
+                'div[aria-label*="Write a comment"]',
+                'div[aria-label*="เขียนความคิดเห็น"]',
+            ]
+            
+            for selector in selectors:
+                try:
+                    comment_box = await temp_page.wait_for_selector(selector, timeout=10000, state="attached")
+                    if comment_box:
+                        print(f"[DEBUG] Found comment box with: {selector}")
+                        logger.info(f"Found comment box with: {selector}")
+                        break
+                except Exception as e:
+                    print(f"[DEBUG] Selector {selector} failed: {e}")
+                    continue
+            
+            if not comment_box:
+                print("[DEBUG] ERROR: Could not find comment box")
+                logger.error("Could not find comment box")
+                return False
+            
+            # Use JavaScript to focus and type
+            print("[DEBUG] Using JavaScript to interact with comment box...")
+            await temp_page.evaluate("""
+                (selector) => {
+                    const box = document.querySelector(selector);
+                    if (box) {
+                        box.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        box.focus();
+                        box.click();
+                    }
+                }
+            """, selectors[0])
+            await temp_page.wait_for_timeout(1000)
+            
+            print(f"[DEBUG] Typing: {message}")
+            await temp_page.keyboard.type(message, delay=50)
+            await temp_page.wait_for_timeout(1000)
+            
+            print("[DEBUG] Pressing Enter...")
+            await temp_page.keyboard.press('Enter')
+            await temp_page.wait_for_timeout(3000)
+            
+            print("[DEBUG] Comment posted!")
+            logger.info(f"[{timestamp}] Manual comment posted successfully in separate session")
+            return True
+            
+        except Exception as e:
+            print(f"[DEBUG] EXCEPTION in post_comment_separate_session: {e}")
+            logger.error(f"Error posting comment in separate session: {e}")
+            import traceback
+            print(f"[DEBUG] Traceback:\n{traceback.format_exc()}")
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return False
+        finally:
+            # Clean up separate session
+            try:
+                if temp_page:
+                    await temp_page.close()
+                if temp_context:
+                    await temp_context.close()
+                if temp_browser:
+                    await temp_browser.close()
+                if temp_playwright:
+                    await temp_playwright.stop()
+                logger.info("Separate browser session closed")
+            except Exception as e:
+                logger.debug(f"Error closing separate session: {e}")
+    
     async def post_comment(self, message: str) -> bool:
         """
-        Post a comment on the current Facebook post.
+        Post a comment on the current Facebook post using the monitoring session.
         
         Args:
             message: The comment text to post

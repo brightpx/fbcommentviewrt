@@ -109,8 +109,8 @@ class CLIRenderer:
         if len(message) > max_length:
             message = message[:max_length] + "…"
 
-        # Time
-        time_str = self._format_time(comment.created_time)
+        # Time with response time if available
+        time_str = self._format_time(comment.created_time, comment.response_time)
 
         table.add_row(tier_badge, author, message, time_str)
 
@@ -172,8 +172,8 @@ class CLIRenderer:
         else:
             return colors['tier4plus']
     
-    def _format_time(self, dt: datetime) -> str:
-        """Format timestamp with relative time."""
+    def _format_time(self, dt: datetime, response_time: Optional[float] = None) -> str:
+        """Format timestamp with relative time and response time."""
         time_str = dt.strftime("%H:%M:%S")
         
         if self.display_config['show_relative_time']:
@@ -190,6 +190,10 @@ class CLIRenderer:
                 relative = f"{int(delta.total_seconds() / 86400)} day ago"
             
             time_str += f" ({relative})"
+        
+        # Add response time if available
+        if response_time is not None:
+            time_str += f" [bright_yellow]↩ {response_time:.2f}s[/bright_yellow]"
         
         return time_str
     
