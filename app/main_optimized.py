@@ -132,7 +132,8 @@ class OptimizedFacebookAutoReply:
             
             print(f"OK Detector initialized")
             print(f"   Owner: {self.detector.owner_name}")
-            print(f"   Tracking: {len(self.detector.known_comment_ids)} existing comments")
+            start_time = self.detector.monitoring_start_time.strftime('%H:%M:%S') if self.detector.monitoring_start_time else 'N/A'
+            print(f"   Using timestamp filtering (start: {start_time})")
             print()
             
             # Show configuration
@@ -231,6 +232,10 @@ class OptimizedFacebookAutoReply:
             
             if success:
                 logger.info(f"SUCCESS: Reply posted to comment {comment_id}")
+                
+                # Mark as replied to prevent duplicate replies
+                self.detector.replied_comment_ids.add(comment_id)
+                logger.info(f"Marked {comment_id} as replied (total: {len(self.detector.replied_comment_ids)})")
                 
                 # Save to database
                 try:

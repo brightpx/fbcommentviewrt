@@ -14,8 +14,9 @@ Key Optimizations:
 
 import asyncio
 import logging
-from typing import List, Optional, Set, Dict, Any
-from datetime import datetime
+import time
+from typing import List, Optional, Set, Dict, Any, Callable
+from datetime import datetime, timedelta
 from playwright.async_api import Page
 
 from ..models.comment import Comment
@@ -34,12 +35,12 @@ class OwnerCommentDetector:
         self.page: Page = scraper.page
         
         # Incremental detection state
-        self.known_comment_ids: Set[str] = set()
         self.owner_name: Optional[str] = None
         self.post_url: str = ""
+        self.monitoring_start_time: Optional[datetime] = None  # Track when monitoring started
+        self.replied_comment_ids: Set[str] = set()  # Track comments we've already replied to
         
         # Performance settings
-        self.top_n = 20  # Scan top 20 comments to catch new test comments
         self.use_mutation_observer = True
         self.scan_count = 0  # Track scan count for periodic page reload
         self.last_reload_time = 0  # Track last reload timestamp
@@ -97,10 +98,14 @@ class OwnerCommentDetector:
             import time
             self.last_reload_time = time.time()
             
-            # Initial scan to populate known_ids
+            # Record monitoring start time (BEFORE initial scan)
+            self.monitoring_start_time = datetime.now()
+            logger.info(f"Monitoring start time: {self.monitoring_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            # Initial scan (no ID tracking needed)
             await self._initial_scan()
             
-            logger.info(f"OK Initialization complete. Tracking {len(self.known_comment_ids)} existing comments")
+            logger.info(f"OK Initialization complete. Using timestamp filtering (start: {self.monitoring_start_time.strftime('%H:%M:%S')})")
             return True
             
         except Exception as e:
@@ -108,20 +113,21 @@ class OwnerCommentDetector:
             return False
     
     async def _initial_scan(self) -> None:
-        """Initial scan - load known comments from database only."""
+        """Initial scan - just wait a moment for page to stabilize.
+        
+        No need to track comment IDs - timestamp filtering handles everything.
+        Called once during initialization.
+        """
         try:
-            # Load existing comments from database to known_comment_ids
-            from app.database.db import CommentDatabase
-            db = CommentDatabase(db_path="database/comments.db")
-            await db.initialize()
+            logger.info("Initial scan: Using timestamp-based detection (no ID tracking needed)")
             
-            # Get all comment IDs for this post from database
-            comment_ids = await db.get_comment_ids(self.post_url)
-            self.known_comment_ids.update(comment_ids)
-            
-            await db.close()
-            
-            logger.info(f"Initial scan: Loaded {len(self.known_comment_ids)} comments from database")
+            # FORCE HARD RELOAD after initial scan to clear Facebook cache
+            # This ensures we see fresh DOM with any new comments
+            logger.info("Forcing hard reload to clear cache...")
+            await self.page.reload(wait_until="domcontentloaded")
+            await asyncio.sleep(0.5)
+            self.last_reload_time = time.time()
+            logger.info("Hard reload complete - ready for fresh comments")
             
         except Exception as e:
             logger.warning(f"Initial scan failed: {e}")
@@ -207,42 +213,57 @@ class OwnerCommentDetector:
             if mutation_ids:
                 logger.info(f"MutationObserver detected {len(mutation_ids)} new comment(s)")
             
-            # Step 2: Get top N comments (fast, localized scan)
-            raw_comments = await self._get_top_n_comments(n=self.top_n)
+            # Step 2: Get TOP 20 newest comments to check for new ones
+            raw_comments = await self._get_top_n_comments(n=20)
             
-            # Step 3: Filter for NEW owner comments only
+            # [DEBUG] Log what we see with timestamp info
+            if raw_comments:
+                logger.info(f"[DEBUG] Found {len(raw_comments)} comments:")
+                for i, comment in enumerate(raw_comments[:5], 1):  # Show first 5 with timestamp
+                    logger.info(f"  [{i}] ID={comment.get('id')}, Author={comment.get('author')[:20]}..., Timestamp={comment.get('timestamp')}")
+            
+            # Step 3: Filter for NEW owner comments using timestamp + author matching
             for raw in raw_comments:
                 comment_id = raw.get('id')
                 author = raw.get('author', '')
+                timestamp_str = raw.get('timestamp', '')
                 
-                # [TEMP DEBUG] Log all comments
-                logger.info(f"[TEMP] Checking comment {comment_id}: author='{author}'")
-                
-                # Skip if already seen in memory
-                if comment_id in self.known_comment_ids:
-                    logger.info(f"[TEMP] → SKIP: already in known_comment_ids")
+                # Parse timestamp to check if comment is NEW (after monitoring started)
+                if self.monitoring_start_time and timestamp_str:
+                    comment_age_minutes = self._parse_facebook_timestamp(timestamp_str)
+                    if comment_age_minutes is not None:
+                        # Calculate when comment was posted
+                        comment_posted_time = datetime.now() - timedelta(minutes=comment_age_minutes)
+                        
+                        # Skip if comment is OLDER than monitoring start time
+                        if comment_posted_time < self.monitoring_start_time:
+                            logger.debug(f"Skipping old comment {comment_id}: posted at {comment_posted_time.strftime('%H:%M:%S')}, monitoring started at {self.monitoring_start_time.strftime('%H:%M:%S')}")
+                            continue
+                    else:
+                        # Could not parse timestamp - skip to be safe
+                        logger.debug(f"Could not parse timestamp '{timestamp_str}' for comment {comment_id}, skipping")
+                        continue
+                else:
+                    # No timestamp available - skip to be safe
+                    logger.debug(f"No timestamp for comment {comment_id}, skipping")
                     continue
                 
-                # Double-check database (in case comment was added during initial scan but not saved)
-                # Skip for now - database check removed to avoid async/connection issues
-                # Will rely on known_comment_ids set only
-                
-                # Skip if not from owner (compare first 10 characters - Facebook may truncate names)
+                # Check if from owner (compare first 10 characters - Facebook may truncate names)
                 if not self.owner_name or len(self.owner_name) < 10:
-                    logger.info(f"[TEMP] → SKIP: owner_name too short ('{self.owner_name}')")
                     continue
                 if len(author) < 10:
-                    logger.info(f"[TEMP] → SKIP: author too short ('{author}')")
                     continue
                 
                 owner_prefix = self.owner_name[:10].lower()
                 author_prefix = author[:10].lower()
-                logger.info(f"[TEMP] Comparing: owner_prefix='{owner_prefix}' vs author_prefix='{author_prefix}'")
                 if owner_prefix != author_prefix:
-                    logger.info(f"[TEMP] → SKIP: name mismatch")
                     continue
                 
-                logger.info(f"[TEMP] → MATCH! This is a NEW owner comment!")
+                # Skip if we've already replied to this comment
+                if comment_id in self.replied_comment_ids:
+                    logger.debug(f"Skipping comment {comment_id}: already replied")
+                    continue
+                    
                 # This is a NEW owner comment!
                 comment = Comment(
                     id=comment_id,
@@ -258,11 +279,11 @@ class OwnerCommentDetector:
                 )
                 
                 new_owner_comments.append(comment)
-                self.known_comment_ids.add(comment_id)
                 self.stats['owner_comments_detected'] += 1
                 
-                logger.info(f"NEW OWNER COMMENT DETECTED: {comment_id}")
+                logger.info(f"✅ NEW OWNER COMMENT DETECTED: {comment_id}")
                 logger.info(f"  Author: {author}")
+                logger.info(f"  Timestamp: {timestamp_str}")
                 logger.info(f"  Message: {comment.message[:50]}...")
                 
                 # Trigger callback if registered
@@ -315,45 +336,37 @@ class OwnerCommentDetector:
             List of raw comment dictionaries
         """
         try:
-            # Smart reload: Only when MutationObserver detects changes but scan finds nothing new
-            # This means Facebook has new comments but they're not in DOM yet
+            # Smart reload: Only reload every 60 seconds to avoid disrupting page state
             import time
             current_time = time.time()
             
-            # Reload if: 10+ seconds since last reload AND we haven't seen new comments
-            if current_time - self.last_reload_time > 10:
-                await self.page.reload(wait_until="domcontentloaded")
-                self.last_reload_time = current_time
-                await asyncio.sleep(0.8)  # Wait for page to stabilize
-                logger.info("Page reloaded to fetch fresh comments")
-                
-                # Aggressive scroll after reload to force Facebook to load new comments
-                await self.page.evaluate("""
-                    window.scrollTo(0, 0);
-                    setTimeout(() => window.scrollTo(0, 500), 100);
-                    setTimeout(() => window.scrollTo(0, 0), 200);
-                """)
-                await asyncio.sleep(0.5)  # Wait for lazy-load to trigger
-            else:
-                # Normal scroll to top
+            # Reload if: 60+ seconds since last reload (much less aggressive)
+            if current_time - self.last_reload_time > 60:
+                try:
+                    await self.page.reload(wait_until="domcontentloaded", timeout=5000)
+                    self.last_reload_time = current_time
+                    await asyncio.sleep(0.5)
+                except Exception as e:
+                    logger.warning(f"Reload failed, continuing without reload: {e}")
+                    # Don't fail - just skip reload and continue
+            
+            # Simple scroll to top (no aggressive scrolling)
+            try:
                 await self.page.evaluate("window.scrollTo(0, 0)")
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.1)
+            except:
+                pass  # Ignore scroll errors
             
             comments = await self.page.evaluate(f"""
                 (topN) => {{
                     // Get ALL articles first
                     const allArticles = document.querySelectorAll('div[role="article"]');
-                    console.log('[TEMP] Total articles found:', allArticles.length);
                     
                     // Filter for COMMENT articles only (have aria-label with "ความคิดเห็นจาก" or "Comment by")
                     const commentArticles = Array.from(allArticles).filter(article => {{
                         const label = article.getAttribute('aria-label');
-                        if (label) {{
-                            console.log('[TEMP] Article aria-label:', label);
-                        }}
                         return label && (label.includes('ความคิดเห็นจาก') || label.includes('Comment by'));
                     }});
-                    console.log('[TEMP] Comment articles found:', commentArticles.length);
                     
                     // Further filter for TOP-LEVEL comments only (T1) - exclude nested articles (T2 replies)
                     const topLevelComments = commentArticles.filter(article => {{
@@ -367,7 +380,6 @@ class OwnerCommentDetector:
                         }}
                         return true; // This is a top-level comment (T1)
                     }});
-                    console.log('[TEMP] Top-level comments found:', topLevelComments.length);
                     
                     const results = [];
                     
@@ -379,29 +391,30 @@ class OwnerCommentDetector:
                         const ariaLabel = article.getAttribute('aria-label');
                         let author = '';
                         
-                        // Try Thai format first
-                        let match = ariaLabel.match(/ความคิดเห็นจาก\\s+(.+?)\\s+เมื่อ/);
+                        // Extract author and timestamp from aria-label
+                        // Thai format: "ความคิดเห็นจาก [Author] เมื่อ [Timestamp]"
+                        // English format: "Comment by [Author] from [Timestamp]"
+                        let match = ariaLabel.match(/ความคิดเห็นจาก\\s+(.+?)\\s+เมื่อ\\s+(.+)/);
+                        let timestamp = null;
                         if (match) {{
                             author = match[1];
+                            timestamp = match[2]; // e.g., "5 นาที", "2 ชั่วโมง", "1 วัน"
                         }} else {{
                             // Try English format
-                            match = ariaLabel.match(/Comment by\\s+(.+?)\\s+from/);
+                            match = ariaLabel.match(/Comment by\\s+(.+?)\\s+from\\s+(.+)/);
                             if (match) {{
                                 author = match[1];
+                                timestamp = match[2]; // e.g., "5 minutes ago", "2 hours ago"
                             }}
                         }}
                         
-                        console.log('[TEMP] Processing article', i, '- author:', author);
-                        
                         if (!author) {{
-                            console.log('[TEMP] → SKIP: No author extracted');
                             continue;
                         }}
                         
                         // Extract comment ID from link
                         const link = article.querySelector('a[href*="comment_id="]');
                         if (!link) {{
-                            console.log('[TEMP] → SKIP: No comment link found');
                             continue;
                         }}
                         
@@ -419,10 +432,7 @@ class OwnerCommentDetector:
                             }}
                         }}
                         
-                        console.log('[TEMP] → Extracted comment ID:', commentId);
-                        
                         if (!commentId) {{
-                            console.log('[TEMP] → SKIP: Could not extract comment ID');
                             continue;
                         }}
                         
@@ -441,7 +451,8 @@ class OwnerCommentDetector:
                             id: commentId,
                             author: author,
                             message: message,
-                            href: href
+                            href: href,
+                            timestamp: timestamp
                         }});
                     }}
                     
@@ -616,7 +627,7 @@ class OwnerCommentDetector:
         logger.info(f"")
         logger.info(f"MONITORING STARTED")
         logger.info(f"   Scan interval: {refresh_interval_ms}ms")
-        logger.info(f"   Scanning top {self.top_n} comments")
+        logger.info(f"   Scanning: TOP 1 newest comment only")
         logger.info(f"   Owner: {self.owner_name}")
         logger.info(f"   Auto-reply: {'ENABLED' if auto_reply_enabled else 'DISABLED'}")
         logger.info(f"   Waiting for owner comments...")
@@ -631,21 +642,7 @@ class OwnerCommentDetector:
                 # Show periodic status (every 50 scans = ~10 seconds)
                 scan_count += 1
                 if scan_count % 50 == 0:
-                    logger.info(f"Monitoring active... (scans: {scan_count}, known comments: {len(self.known_comment_ids)})")
-                
-                # Auto-reply if enabled (INSTANT - no callback delay)
-                if auto_reply_enabled and reply_message and new_owner_comments:
-                    for comment in new_owner_comments:
-                        logger.info(f"Owner comment detected: {comment.id}")
-                        logger.info(f"   Message: {comment.message[:50]}...")
-                        
-                        # Instant reply
-                        success = await self.reply_instantly(comment.id, reply_message)
-                        
-                        if success:
-                            logger.info(f"OK Auto-reply posted to {comment.id}")
-                        else:
-                            logger.error(f"FAILED to auto-reply to {comment.id}")
+                    logger.info(f"Monitoring active... (scans: {scan_count}, using timestamp filtering)")
                 
                 # Sleep before next scan
                 await asyncio.sleep(refresh_interval)
@@ -677,8 +674,62 @@ class OwnerCommentDetector:
         """Get performance statistics."""
         return {
             **self.stats,
-            'known_comments': len(self.known_comment_ids),
             'owner_name': self.owner_name,
+            'monitoring_start': self.monitoring_start_time.strftime('%H:%M:%S') if self.monitoring_start_time else None,
             'avg_detection_ms': self.stats['avg_detection_latency'] * 1000,
             'avg_reply_ms': self.stats['avg_reply_latency'] * 1000
         }
+    
+    def _parse_facebook_timestamp(self, timestamp_str: str) -> Optional[int]:
+        """Parse Facebook timestamp string to minutes ago.
+        
+        Supports both Thai and English formats:
+        - Thai: "5 นาที", "2 ชั่วโมง", "1 วัน", "15 ชั่วโมงที่แล้ว", "สักครู่"
+        - English: "5 minutes ago", "2 hours ago", "1 day ago", "just now"
+        
+        Args:
+            timestamp_str: Timestamp string from aria-label
+            
+        Returns:
+            Number of minutes ago, or None if parsing failed
+        """
+        if not timestamp_str:
+            return None
+        
+        timestamp_str = timestamp_str.strip().lower()
+        
+        # Handle "just now" / "สักครู่" / "ไม่กี่วินาทีที่แล้ว" (a few seconds ago)
+        if timestamp_str in ['just now', 'สักครู่', 'a moment ago', 'ไม่กี่วินาทีที่แล้ว', 'a few seconds ago']:
+            return 0
+        
+        import re
+        
+        # Try Thai format: "5 นาที", "2 ชั่วโมง", "1 วัน", "15 ชั่วโมงที่แล้ว"
+        # Match patterns with optional "ที่แล้ว" suffix
+        match = re.match(r'(\d+)\s*(นาที|ชั่วโมง|วัน)(?:ที่แล้ว)?', timestamp_str)
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2)
+            
+            if unit == 'นาที':
+                return value
+            elif unit == 'ชั่วโมง':
+                return value * 60
+            elif unit == 'วัน':
+                return value * 60 * 24
+        
+        # Try English format: "5 minutes ago", "2 hours ago", "1 day ago"
+        match = re.match(r'(\d+)\s*(minute|hour|day)s?\s*ago', timestamp_str)
+        if match:
+            value = int(match.group(1))
+            unit = match.group(2)
+            
+            if unit == 'minute':
+                return value
+            elif unit == 'hour':
+                return value * 60
+            elif unit == 'day':
+                return value * 60 * 24
+        
+        logger.warning(f"Failed to parse timestamp: {timestamp_str}")
+        return None
