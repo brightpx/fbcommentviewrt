@@ -39,6 +39,7 @@ class OwnerCommentDetector:
         self.post_url: str = ""
         self.monitoring_start_time: Optional[datetime] = None  # Track when monitoring started
         self.replied_comment_ids: Set[str] = set()  # Track comments we've already replied to
+        self.bot_reply_texts: Set[str] = set()  # Track bot reply texts to prevent self-reply loop
         
         # Performance settings
         self.use_mutation_observer = True
@@ -97,6 +98,14 @@ class OwnerCommentDetector:
             # Initialize last reload time
             import time
             self.last_reload_time = time.time()
+            
+            # Seed bot_reply_texts with the configured reply message so the bot
+            # never treats its OWN past replies (which appear as owner comments
+            # with the NEWEST IDs) as new comments to reply to — this prevents
+            # the self-reply loop when the monitor restarts.
+            reply_message = self.config.get('auto_reply', {}).get('reply_message', '')
+            if reply_message:
+                self.add_bot_reply_text(reply_message)
             
             # Record monitoring start time (BEFORE initial scan)
             self.monitoring_start_time = datetime.now()
@@ -218,11 +227,14 @@ class OwnerCommentDetector:
             
             # [DEBUG] Log what we see with timestamp info
             if raw_comments:
-                logger.info(f"[DEBUG] Found {len(raw_comments)} comments:")
-                for i, comment in enumerate(raw_comments[:5], 1):  # Show first 5 with timestamp
-                    logger.info(f"  [{i}] ID={comment.get('id')}, Author={comment.get('author')[:20]}..., Timestamp={comment.get('timestamp')}")
+                logger.debug(f"Found {len(raw_comments)} comments in scan")
+                for i, comment in enumerate(raw_comments[:5], 1):
+                    logger.debug(f"  [{i}] ID={comment.get('id')}, Author={comment.get('author')[:20]}..., Timestamp={comment.get('timestamp')}")
             
             # Step 3: Filter for NEW owner comments using timestamp + author matching
+            skipped_old = 0
+            candidate_comments = []  # Collect all matching comments, then pick the NEWEST
+            
             for raw in raw_comments:
                 comment_id = raw.get('id')
                 author = raw.get('author', '')
@@ -237,15 +249,13 @@ class OwnerCommentDetector:
                         
                         # Skip if comment is OLDER than monitoring start time
                         if comment_posted_time < self.monitoring_start_time:
-                            logger.debug(f"Skipping old comment {comment_id}: posted at {comment_posted_time.strftime('%H:%M:%S')}, monitoring started at {self.monitoring_start_time.strftime('%H:%M:%S')}")
+                            skipped_old += 1
                             continue
                     else:
                         # Could not parse timestamp - skip to be safe
-                        logger.debug(f"Could not parse timestamp '{timestamp_str}' for comment {comment_id}, skipping")
                         continue
                 else:
                     # No timestamp available - skip to be safe
-                    logger.debug(f"No timestamp for comment {comment_id}, skipping")
                     continue
                 
                 # Check if from owner (compare first 10 characters - Facebook may truncate names)
@@ -261,16 +271,39 @@ class OwnerCommentDetector:
                 
                 # Skip if we've already replied to this comment
                 if comment_id in self.replied_comment_ids:
-                    logger.debug(f"Skipping comment {comment_id}: already replied")
+                    continue
+                
+                # Skip if comment text matches bot's own reply message (prevent self-reply loop)
+                comment_message = raw.get('message', '')
+                if comment_message in self.bot_reply_texts:
+                    logger.debug(f"Skipping bot reply comment {comment_id}: '{comment_message[:40]}...'")
                     continue
                     
-                # This is a NEW owner comment!
+                # This is a NEW owner comment! Add as candidate
+                candidate_comments.append({
+                    'comment_id': comment_id,
+                    'author': author,
+                    'message': raw.get('message', ''),
+                    'timestamp_str': timestamp_str,
+                    'comment_age_minutes': comment_age_minutes
+                })
+            
+            # Sort candidates by newest first.
+            # Facebook timestamps are coarse ("X hours ago"), so age alone can't
+            # order comments within the same hour. Facebook comment IDs are assigned
+            # chronologically (monotonic snowflake IDs), so a HIGHER id is ALWAYS a
+            # NEWER comment. Use comment ID (descending) as the primary sort key —
+            # this is far more precise than the coarse relative timestamp.
+            candidate_comments.sort(key=lambda c: -int(c['comment_id']))
+            
+            for cand in candidate_comments:
+                comment_id = cand['comment_id']
                 comment = Comment(
                     id=comment_id,
                     parent_id=None,
                     tier=1,
-                    author=author,
-                    message=raw.get('message', ''),
+                    author=cand['author'],
+                    message=cand['message'],
                     created_time=datetime.now(),
                     last_seen=datetime.now(),
                     display_order=0,
@@ -282,15 +315,15 @@ class OwnerCommentDetector:
                 self.stats['owner_comments_detected'] += 1
                 
                 logger.info(f"✅ NEW OWNER COMMENT DETECTED: {comment_id}")
-                logger.info(f"  Author: {author}")
-                logger.info(f"  Timestamp: {timestamp_str}")
+                logger.info(f"  Author: {cand['author']}")
+                logger.info(f"  Timestamp: {cand['timestamp_str']}")
                 logger.info(f"  Message: {comment.message[:50]}...")
                 
                 # Trigger callback if registered
                 if self.on_owner_comment:
                     await self.on_owner_comment({
                         'comment_id': comment_id,
-                        'author': author,
+                        'author': cand['author'],
                         'text': comment.message
                     })
                 
@@ -336,26 +369,28 @@ class OwnerCommentDetector:
             List of raw comment dictionaries
         """
         try:
-            # Smart reload: Only reload every 60 seconds to avoid disrupting page state
+            # Smart reload: Only when MutationObserver detects changes but scan finds nothing new
+            # This means Facebook has new comments but they're not in DOM yet
             import time
             current_time = time.time()
             
-            # Reload if: 60+ seconds since last reload (much less aggressive)
-            if current_time - self.last_reload_time > 60:
-                try:
-                    await self.page.reload(wait_until="domcontentloaded", timeout=5000)
-                    self.last_reload_time = current_time
-                    await asyncio.sleep(0.5)
-                except Exception as e:
-                    logger.warning(f"Reload failed, continuing without reload: {e}")
-                    # Don't fail - just skip reload and continue
-            
-            # Simple scroll to top (no aggressive scrolling)
-            try:
+            # Reload if: 10+ seconds since last reload AND we haven't seen new comments
+            if current_time - self.last_reload_time > 10:
+                await self.page.reload(wait_until="domcontentloaded")
+                self.last_reload_time = current_time
+                await asyncio.sleep(0.3)  # Reduced wait time
+                
+                # Aggressive scroll after reload to force Facebook to load new comments
+                await self.page.evaluate("""
+                    window.scrollTo(0, 0);
+                    setTimeout(() => window.scrollTo(0, 500), 100);
+                    setTimeout(() => window.scrollTo(0, 0), 200);
+                """)
+                await asyncio.sleep(0.2)  # Reduced wait time
+            else:
+                # Normal scroll to top
                 await self.page.evaluate("window.scrollTo(0, 0)")
                 await asyncio.sleep(0.1)
-            except:
-                pass  # Ignore scroll errors
             
             comments = await self.page.evaluate(f"""
                 (topN) => {{
@@ -483,7 +518,7 @@ class OwnerCommentDetector:
         reply_start = datetime.now()
         
         try:
-            logger.info(f"Attempting instant reply to {comment_id}")
+            logger.debug(f"Replying to comment {comment_id}")
             
             # Step 1: Click reply button using Playwright
             try:
@@ -494,7 +529,7 @@ class OwnerCommentDetector:
                 ).first()
                 
                 await reply_button.click()
-                logger.info("OK Reply button clicked")
+                logger.debug("Reply button clicked")
                 
             except Exception as e:
                 logger.error(f"Failed to click reply button: {e}")
@@ -523,12 +558,12 @@ class OwnerCommentDetector:
                     logger.error("No reply textbox found (aria-label filter)")
                     return False
                 
-                logger.info(f"OK Found reply textbox")
+                logger.debug("Reply textbox found")
                 
                 # CRITICAL: Use .fill() instead of innerText
                 # This properly triggers input events that enable Facebook's submit button
                 await reply_textbox.fill(message)
-                logger.info(f"OK Message filled using .fill() method")
+                logger.debug("Message filled in reply box")
                 
                 # Wait for input to settle and submit button to enable
                 await self.page.wait_for_timeout(200)
@@ -536,7 +571,7 @@ class OwnerCommentDetector:
                 # Press Enter on the textbox itself (not page.keyboard)
                 await reply_textbox.press('Enter')
                 
-                logger.info("OK Enter pressed on textbox")
+                logger.debug("Enter pressed on textbox")
                 
             except Exception as e:
                 logger.error(f"Failed to fill/press Enter: {e}")
@@ -624,14 +659,8 @@ class OwnerCommentDetector:
         auto_reply_enabled = self.config.get('auto_reply', {}).get('enabled', False)
         reply_message = self.config.get('auto_reply', {}).get('reply_message', '')
         
-        logger.info(f"")
-        logger.info(f"MONITORING STARTED")
-        logger.info(f"   Scan interval: {refresh_interval_ms}ms")
-        logger.info(f"   Scanning: TOP 1 newest comment only")
-        logger.info(f"   Owner: {self.owner_name}")
-        logger.info(f"   Auto-reply: {'ENABLED' if auto_reply_enabled else 'DISABLED'}")
-        logger.info(f"   Waiting for owner comments...")
-        logger.info(f"")
+        logger.info("MONITORING STARTED")
+        logger.info(f"   Scan interval: {refresh_interval_ms}ms | Owner: {self.owner_name} | Auto-reply: {'ON' if auto_reply_enabled else 'OFF'}")
         
         scan_count = 0
         while True:
@@ -639,10 +668,10 @@ class OwnerCommentDetector:
                 # Detect new owner comments
                 new_owner_comments = await self.detect_new_owner_comments()
                 
-                # Show periodic status (every 50 scans = ~10 seconds)
+                # Show periodic status every 300 scans (~60 seconds at 200ms intervals)
                 scan_count += 1
-                if scan_count % 50 == 0:
-                    logger.info(f"Monitoring active... (scans: {scan_count}, using timestamp filtering)")
+                if scan_count % 300 == 0:
+                    logger.debug(f"Monitoring active... (scans: {scan_count})")
                 
                 # Sleep before next scan
                 await asyncio.sleep(refresh_interval)
@@ -680,6 +709,19 @@ class OwnerCommentDetector:
             'avg_reply_ms': self.stats['avg_reply_latency'] * 1000
         }
     
+    def add_bot_reply_text(self, text: str) -> None:
+        """Register bot reply text to prevent self-reply loop.
+        
+        When the bot posts a reply, Facebook may show it as a new comment
+        from the owner. By registering the reply text here, the detector
+        will skip comments that match known bot reply messages.
+        
+        Args:
+            text: The reply message text that the bot posted
+        """
+        self.bot_reply_texts.add(text)
+        logger.debug(f"Registered bot reply text: '{text[:40]}...' (total: {len(self.bot_reply_texts)})")
+    
     def _parse_facebook_timestamp(self, timestamp_str: str) -> Optional[int]:
         """Parse Facebook timestamp string to minutes ago.
         
@@ -705,8 +747,31 @@ class OwnerCommentDetector:
         import re
         
         # Try Thai format: "5 นาที", "2 ชั่วโมง", "1 วัน", "15 ชั่วโมงที่แล้ว"
-        # Match patterns with optional "ที่แล้ว" suffix
-        match = re.match(r'(\d+)\s*(นาที|ชั่วโมง|วัน)(?:ที่แล้ว)?', timestamp_str)
+        # Also handles "ประมาณ 5 นาทีที่แล้ว" (approximate format)
+        # Also handles "หนึ่งวันที่แล้ว" (Thai word for 1)
+        # Match patterns with optional "ประมาณ" prefix and optional "ที่แล้ว" suffix
+        
+        # Map Thai number words to digits
+        thai_num_map = {
+            'หนึ่ง': '1', 'สอง': '2', 'สาม': '3', 'สี่': '4', 'ห้า': '5',
+            'หก': '6', 'เจ็ด': '7', 'แปด': '8', 'เก้า': '9', 'สิบ': '10'
+        }
+        
+        # Try with Thai number words first
+        match = re.match(r'(?:ประมาณ\s*)?(หนึ่ง|สอง|สาม|สี่|ห้า|หก|เจ็ด|แปด|เก้า|สิบ)\s*(นาที|ชั่วโมง|วัน)(?:ที่แล้ว)?', timestamp_str)
+        if match:
+            value = int(thai_num_map[match.group(1)])
+            unit = match.group(2)
+            
+            if unit == 'นาที':
+                return value
+            elif unit == 'ชั่วโมง':
+                return value * 60
+            elif unit == 'วัน':
+                return value * 60 * 24
+        
+        # Try with numeric digits
+        match = re.match(r'(?:ประมาณ\s*)?(\d+)\s*(นาที|ชั่วโมง|วัน)(?:ที่แล้ว)?', timestamp_str)
         if match:
             value = int(match.group(1))
             unit = match.group(2)

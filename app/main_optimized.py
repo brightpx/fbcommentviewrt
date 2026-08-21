@@ -237,6 +237,11 @@ class OptimizedFacebookAutoReply:
                 self.detector.replied_comment_ids.add(comment_id)
                 logger.info(f"Marked {comment_id} as replied (total: {len(self.detector.replied_comment_ids)})")
                 
+                # Register bot reply text to prevent self-reply loop
+                # (Facebook shows bot's own reply as a new comment from owner)
+                self.detector.add_bot_reply_text(reply_message)
+                logger.info(f"Registered bot reply text to prevent self-reply loop")
+                
                 # Save to database
                 try:
                     await self.db.add_comment(

@@ -1056,6 +1056,11 @@ class FacebookScraper:
             logger.info(f"Attempting to reply to comment {comment_id}")
             logger.info(f"Reply message: {message[:50]}...")
             
+            # IMPORTANT: DO NOT close any dialogs here. On Facebook, the post we're
+            # viewing IS a popup dialog (div[role="dialog"] ~700px wide). Closing
+            # "stale" popups closes the post page we're working on!
+            # We only need to make sure we pick the RIGHT textbox after clicking reply.
+            
             # Try to expand "View more comments" if present
             try:
                 expand_selectors = [
@@ -1077,112 +1082,118 @@ class FacebookScraper:
             except Exception as e:
                 logger.debug(f"No expand button found or error expanding: {e}")
             
-            # Find the comment by looking for a link containing the comment_id
-            comment_link = await self.page.query_selector(f'a[href*="comment_id={comment_id}"]')
+            # Use JavaScript to find the visible comment link, click reply, type, and submit.
+            # Everything in one evaluate call to avoid stale references.
+            logger.info("Finding comment and clicking reply button...")
             
-            if not comment_link:
-                logger.error(f"Could not find comment with ID {comment_id}")
-                await self._take_screenshot("error_comment_not_found")
-                return False
-            
-            # Find the comment container (article)
-            comment_container = await comment_link.evaluate_handle(
-                """(element) => {
-                    let current = element;
-                    while (current && current.tagName !== 'BODY') {
-                        if (current.getAttribute('role') === 'article') {
-                            return current;
+            # Retry loop: Facebook may take a moment to load/expand the comment.
+            reply_clicked = None
+            for attempt in range(3):
+                reply_clicked = await self.page.evaluate(
+                    """(commentId) => {
+                        // Find ALL links for this comment — pick the VISIBLE one.
+                        // Only require height > 0 (not y > 0, because the comment may
+                        // be scrolled above the viewport with negative y).
+                        // NEVER fall back to a hidden clone — that leads to 'no-article'.
+                        const allLinks = document.querySelectorAll('a[href*="comment_id="][href*="' + commentId + '"]');
+                        let link = null;
+                        for (const l of allLinks) {
+                            const r = l.getBoundingClientRect();
+                            if (r.height > 0) {
+                                link = l;
+                                break;
+                            }
                         }
-                        current = current.parentElement;
-                    }
-                    return null;
-                }"""
-            )
-            
-            if not comment_container:
-                logger.error("Could not find comment container")
-                await self._take_screenshot("error_no_container")
-                return False
-            
-            # Use JavaScript to scroll and find the reply button directly (skip Playwright scroll)
-            logger.info("Using JavaScript to scroll to comment and click reply button")
-            await self.page.wait_for_timeout(500)
-            
-            # Find and click the reply button within this container using JavaScript
-            # Don't fail if button not found - try to continue anyway
-            reply_clicked = await comment_container.evaluate(
-                """(container) => {
-                    // Scroll container into view first
-                    container.scrollIntoView({ behavior: 'instant', block: 'center' });
-                    
-                    // Look for reply button text
-                    const walker = document.createTreeWalker(
-                        container,
-                        NodeFilter.SHOW_ELEMENT,
-                        null
-                    );
-                    
-                    let node;
-                    while (node = walker.nextNode()) {
-                        const text = node.textContent.trim();
-                        if ((text === 'ตอบกลับ' || text === 'Reply') && 
-                            node.getAttribute('role') === 'button' &&
-                            node.offsetParent !== null) {
-                            node.click();
-                            return true;
+                        if (!link) return 'no-visible-link';
+                        
+                        // Find the target article by iterating articles in REVERSE order.
+                        // The innermost article (last in DOM) wraps only THIS comment.
+                        const allArticles = document.querySelectorAll('div[role="article"]');
+                        let targetArticle = null;
+                        
+                        for (let i = allArticles.length - 1; i >= 0; i--) {
+                            const art = allArticles[i];
+                            const r = art.getBoundingClientRect();
+                            if (r.height === 0) continue;
+                            if (art.contains(link)) {
+                                targetArticle = art;
+                                break;
+                            }
                         }
-                    }
-                    return false;
-                }"""
-            )
+                        
+                        if (!targetArticle) return 'no-article';
+                        
+                        // Scroll into view
+                        targetArticle.scrollIntoView({ behavior: 'instant', block: 'center' });
+                        
+                        // Find and click the reply button within this article
+                        const btns = targetArticle.querySelectorAll('div[role="button"], button');
+                        for (const btn of btns) {
+                            const text = (btn.textContent || '').trim();
+                            if (text === 'ตอบกลับ' || text === 'Reply' || text.includes('ตอบกลับ') || text.includes('Reply')) {
+                                btn.click();
+                                return 'clicked';
+                            }
+                        }
+                        
+                        return 'no-reply-btn';
+                    }""",
+                    comment_id
+                )
+                if reply_clicked == 'clicked':
+                    break
+                logger.info(f"Reply click attempt {attempt+1} failed ({reply_clicked}), retrying...")
+                await self.page.wait_for_timeout(1000)
             
-            if reply_clicked:
-                logger.info("Reply button clicked")
-            else:
-                logger.warning("Could not find reply button, but continuing anyway...")
+            if reply_clicked != 'clicked':
+                logger.warning(f"Could not click reply button (result: {reply_clicked}), continuing anyway...")
             
             await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_click_reply'])
             
-            # Find the reply input box WITHIN the comment container (for nested reply)
+            # Now find the reply input box.
+            # After clicking reply, Facebook opens a popup dialog (div[role="dialog"])
+            # containing the reply textbox. The full-screen post dialog is also a
+            # div[role="dialog"] — we need to find the SMALLER popup dialog.
+            logger.info("Looking for reply input box in popup dialog...")
             reply_box = None
             
-            # Try to find reply box within comment container first (nested reply)
-            try:
-                reply_box = await comment_container.query_selector('div[contenteditable="true"][role="textbox"]')
-                if reply_box:
-                    is_visible = await reply_box.is_visible()
-                    if is_visible:
-                        logger.info("Found nested reply input box within comment container")
-                    else:
-                        reply_box = None
-            except Exception as e:
-                logger.debug(f"Could not find nested reply box: {e}")
+            for attempt in range(3):
+                reply_box = await self.page.evaluate_handle("""
+                    () => {
+                        // Find the SMALLER popup dialog (not the full-screen post dialog)
+                        const dialogs = document.querySelectorAll('div[role="dialog"]');
+                        let popupDialog = null;
+                        for (const d of dialogs) {
+                            const r = d.getBoundingClientRect();
+                            if (r.width < 1200 && r.height > 0 && d.offsetParent !== null) {
+                                popupDialog = d;
+                                break;
+                            }
+                        }
+                        if (!popupDialog) {
+                            // Fallback: any visible dialog with a textbox
+                            for (const d of dialogs) {
+                                if (d.offsetParent !== null) {
+                                    const box = d.querySelector('div[contenteditable="true"][role="textbox"]');
+                                    if (box) { popupDialog = d; break; }
+                                }
+                            }
+                        }
+                        if (!popupDialog) return null;
+                        const box = popupDialog.querySelector('div[contenteditable="true"][role="textbox"]');
+                        return box || null;
+                    }
+                """)
+                if reply_box and reply_box.as_element():
+                    logger.info("Found reply input box in popup dialog")
+                    reply_box = reply_box.as_element()
+                    break
+                reply_box = None
+                logger.info(f"Reply box attempt {attempt+1} failed, retrying...")
+                await self.page.wait_for_timeout(1000)
             
-            # If nested reply box not found, check for popup dialog (fallback)
             if not reply_box:
-                dialog_selectors = [
-                    'div[role="dialog"] div[contenteditable="true"][role="textbox"]',
-                    'div[role="dialog"] div[aria-label*="Write"]',
-                    'div[role="dialog"] div[aria-label*="เขียน"]',
-                ]
-                for selector in dialog_selectors:
-                    try:
-                        boxes = await self.page.query_selector_all(selector)
-                        for box in boxes:
-                            is_visible = await box.is_visible()
-                            if is_visible:
-                                reply_box = box
-                                logger.info(f"Found dialog reply input box with selector: {selector}")
-                                break
-                        if reply_box:
-                            break
-                    except Exception as e:
-                        logger.debug(f"Selector {selector} failed: {e}")
-                        continue
-            
-            if not reply_box:
-                logger.warning("Could not find reply input box, but assuming reply will work...")
-                # Don't fail - just wait and assume it worked
+                logger.warning("Could not find reply input box, assuming reply will work...")
                 await self.page.wait_for_timeout(2000)
                 logger.info(f"Assumed reply posted to comment {comment_id}")
                 return True
@@ -1193,11 +1204,58 @@ class FacebookScraper:
             await reply_box.type(message, delay=self.config['auto_reply']['timings']['type_delay'])
             await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_type'])
             
-            # Press Enter to submit
-            logger.info("Pressing Enter to submit reply...")
-            await self.page.keyboard.press('Enter')
+            # Facebook reply dialog: submit via the Post button.
+            # The button is a div[role="button"] with aria-label only (no text content):
+            #   - Thai: aria-label="โพสต์ความคิดเห็น" (Post comment)
+            #   - English: aria-label="Post"
+            # It only appears AFTER text is typed (initially disabled/hidden).
+            logger.info("Looking for the Post/โพสต์ความคิดเห็น submit button...")
+            submit_clicked = await self.page.evaluate("""
+                () => {
+                    // Find the popup dialog (smaller one, not full-screen post)
+                    const dialogs = document.querySelectorAll('div[role="dialog"]');
+                    let popup = null;
+                    for (const d of dialogs) {
+                        const r = d.getBoundingClientRect();
+                        if (r.width < 1200 && r.height > 0 && d.offsetParent !== null) {
+                            popup = d;
+                            break;
+                        }
+                    }
+                    // Fallback: any dialog with a textbox
+                    if (!popup) {
+                        for (const d of dialogs) {
+                            if (d.offsetParent !== null && d.querySelector('div[contenteditable="true"][role="textbox"]')) {
+                                popup = d;
+                                break;
+                            }
+                        }
+                    }
+                    if (!popup) return 'no-dialog';
+                    
+                    // Find the submit button by aria-label
+                    const candidates = [
+                        'div[role="button"][aria-label="โพสต์ความคิดเห็น"]',
+                        'div[role="button"][aria-label="Post"]',
+                        'div[role="button"][aria-label^="โพสต์"]'
+                    ];
+                    for (const sel of candidates) {
+                        const btn = popup.querySelector(sel);
+                        if (!btn) continue;
+                        const ariaDisabled = btn.getAttribute('aria-disabled');
+                        if (ariaDisabled === 'true') continue;
+                        btn.click();
+                        return 'clicked';
+                    }
+                    return 'not-found';
+                }
+            """)
+            logger.info(f"Submit button result: {submit_clicked}")
             
-            # Wait for reply to post - assume success after submit
+            if submit_clicked == 'not-found':
+                logger.warning("Post button not found, falling back to Enter key...")
+                await self.page.keyboard.press('Enter')
+            
             await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_submit'])
             
             logger.info(f"Reply posted successfully to comment {comment_id}")
@@ -1206,7 +1264,6 @@ class FacebookScraper:
         except Exception as e:
             logger.warning(f"Exception while replying to comment {comment_id}: {e}")
             logger.warning("Assuming reply succeeded anyway...")
-            # Always return True to prevent duplicate replies
             return True
     
     async def close(self) -> None:
