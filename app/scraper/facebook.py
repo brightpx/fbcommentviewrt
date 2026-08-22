@@ -292,68 +292,243 @@ class FacebookScraper:
             target_texts = mode_text_map[mode]
             logger.info(f"Switching to '{mode}' comment view...")
             
-            # Look for sorting dropdown - try multiple selectors
-            sorting_selectors = [
-                'div[role="button"]:has-text("Most relevant")',
-                'div[role="button"]:has-text("เกี่ยวข้องมากสุด")',
-                'div[role="button"]:has-text("All comments")',
-                'div[role="button"]:has-text("ความคิดเห็นทั้งหมด")',
-                # Try to find by aria-label
-                '[aria-label*="Sort"]',
-                '[aria-label*="เรียง"]',
-            ]
+            # STEP 1: Find the dropdown TRIGGER via JavaScript text matching.
+            # The trigger shows the CURRENT sort mode (e.g. "เกี่ยวข้องมากที่สุด").
+            # CSS :has-text() selectors miss it because Facebook renders the label
+            # in deeply nested spans, so we match trimmed textContent instead and
+            # mark the element for a trusted Playwright click.
+            # RETRY: right after page load the comments section (and its sort
+            # button) may not be rendered yet — poll for up to ~15s.
+            trigger_text = None
+            for attempt in range(6):
+                trigger_text = await self.page.evaluate(
+                    """
+                    (labels) => {
+                        const candidates = document.querySelectorAll(
+                            'div[role="button"], span[role="button"], [aria-haspopup="menu"]'
+                        );
+                        let best = null;
+                        for (const el of candidates) {
+                            const text = (el.textContent || '').trim();
+                            if (!text || text.length > 60) continue;
+                            if (!labels.some(l => text === l || text.endsWith(' ' + l))) continue;
+                            // Facebook renders hidden duplicates for other viewports —
+                            // only accept elements that are actually rendered.
+                            const r = el.getBoundingClientRect();
+                            if (r.height <= 0 || r.width <= 0) continue;
+                            const style = getComputedStyle(el);
+                            if (style.visibility === 'hidden' || style.display === 'none') continue;
+                            // Prefer the INNERMOST matching element (smallest text)
+                            if (!best || text.length < (best.textContent || '').trim().length) {
+                                best = el;
+                            }
+                        }
+                        if (!best) return null;
+                        best.setAttribute('data-sort-trigger', '1');
+                        return (best.textContent || '').trim();
+                    }
+                    """,
+                    ["เกี่ยวข้องมากที่สุด", "ความเกี่ยวข้องมากที่สุด", "Most relevant",
+                     "ใหม่ล่าสุด", "Most recent", "ความคิดเห็นทั้งหมด", "All comments"]
+                )
+                if trigger_text:
+                    break
+                logger.info(f"Sort trigger not rendered yet (attempt {attempt + 1}/6), scrolling and retrying...")
+                await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await self.page.wait_for_timeout(2500)
             
-            sorting_button = None
-            for selector in sorting_selectors:
-                try:
-                    sorting_button = await self.page.query_selector(selector)
-                    if sorting_button:
-                        logger.info(f"Found sorting button with selector: {selector}")
-                        break
-                except:
-                    continue
-            
-            if not sorting_button:
+            if not trigger_text:
                 logger.warning("Could not find sorting dropdown button")
                 await self._take_screenshot("02_no_sorting_button")
                 return False
             
-            # Click sorting button
-            await sorting_button.scroll_into_view_if_needed()
-            await sorting_button.click()
-            await self.page.wait_for_timeout(self.config['browser']['timings']['dropdown_wait'])
-            await self._take_screenshot("03_sorting_menu_opened")
+            logger.info(f"Found sorting trigger showing: {trigger_text}")
             
-            # Click target sorting option
-            option_selectors = []
-            for text in target_texts:
-                option_selectors.extend([
-                    f'div[role="menuitem"]:has-text("{text}")',
-                    f'div[role="menuitemradio"]:has-text("{text}")',
-                ])
+            # STEP 1b: Open the menu. The trigger div is only ~10px tall and
+            # elementHandle.click() times out on it, so we click its CENTER
+            # COORDINATES with real mouse events. The post dialog has its own
+            # internal scroll container, so the trigger can sit BELOW the
+            # viewport — scrollIntoView() first or the click lands off-target.
+            # Coordinates are RE-COMPUTED every attempt because React may
+            # re-render the node (dropping our marker) or shift the layout.
+            locate_trigger_js = """(labels) => {
+                const candidates = document.querySelectorAll(
+                    'div[role="button"], span[role="button"], [aria-haspopup="menu"]'
+                );
+                let best = null;
+                for (const el of candidates) {
+                    const text = (el.textContent || '').trim();
+                    if (!text || text.length > 60) continue;
+                    if (!labels.some(l => text === l || text.endsWith(' ' + l))) continue;
+                    const r = el.getBoundingClientRect();
+                    if (r.height <= 0 || r.width <= 0) continue;
+                    const s = getComputedStyle(el);
+                    if (s.visibility === 'hidden' || s.display === 'none') continue;
+                    if (!best || text.length < (best.textContent || '').trim().length) {
+                        best = el;
+                    }
+                }
+                if (!best) return null;
+                best.scrollIntoView({ block: 'center', behavior: 'instant' });
+                best.setAttribute('data-sort-trigger', '1');
+                const r = best.getBoundingClientRect();
+                return { x: r.x + r.width / 2, y: r.y + r.height / 2 };
+            }"""
             
-            target_option = None
-            for selector in option_selectors:
-                try:
-                    target_option = await self.page.query_selector(selector)
-                    if target_option:
-                        logger.info(f"Found '{mode}' option with selector: {selector}")
+            option_box = None
+            for attempt in range(4):
+                # If a menu is ALREADY open (e.g. previous click worked but the
+                # option scan raced), do NOT click again — that would toggle
+                # the menu closed. Just poll for the option below.
+                menu_open = await self.page.evaluate(
+                    """() => {
+                        for (const m of document.querySelectorAll('[role="menu"]')) {
+                            const r = m.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) return true;
+                        }
+                        return false;
+                    }"""
+                )
+                
+                if not menu_open:
+                    box = await self.page.evaluate(locate_trigger_js,
+                        ["เกี่ยวข้องมากที่สุด", "ความเกี่ยวข้องมากที่สุด", "Most relevant",
+                         "ใหม่ล่าสุด", "Most recent", "ความคิดเห็นทั้งหมด", "All comments"])
+                    if not box:
+                        logger.warning(f"Sorting trigger disappeared (attempt {attempt + 1}/4)")
+                        await self.page.wait_for_timeout(1000)
+                        continue
+                    await self.page.wait_for_timeout(300)
+                    
+                    # Escalating click strategies: plain coordinate click usually
+                    # works; force-click handles overlay interference; keyboard
+                    # activation is the last resort for stubborn renders.
+                    try:
+                        if attempt <= 1:
+                            await self.page.mouse.click(box['x'], box['y'])
+                        elif attempt == 2:
+                            trigger_el = await self.page.query_selector('[data-sort-trigger="1"]')
+                            if trigger_el:
+                                await trigger_el.click(force=True, timeout=3000)
+                            else:
+                                await self.page.mouse.click(box['x'], box['y'])
+                        else:
+                            await self.page.evaluate(
+                                """() => {
+                                    const el = document.querySelector('[data-sort-trigger="1"]');
+                                    if (el) { el.focus(); }
+                                }"""
+                            )
+                            await self.page.keyboard.press('Enter')
+                            await self.page.wait_for_timeout(400)
+                            await self.page.keyboard.press(' ')
+                    except Exception as click_err:
+                        logger.warning(f"Trigger click attempt {attempt + 1} failed: {click_err}")
+                
+                # STEP 2: POLL for the target option inside the open menu
+                # (up to ~3s) instead of a single fixed-wait check — the menu
+                # may animate in slightly after the click.
+                # Menu leaves may carry no ARIA role at all, so we simply look
+                # for the innermost visible element whose text matches exactly
+                # and return its center coordinates for a coordinate click.
+                find_option_js = """
+                    (targetTexts) => {
+                        let best = null;
+                        for (const menu of document.querySelectorAll('[role="menu"]')) {
+                            for (const el of menu.querySelectorAll('*')) {
+                                const text = (el.textContent || '').trim();
+                                if (!targetTexts.includes(text)) continue;
+                                const r = el.getBoundingClientRect();
+                                if (r.width <= 0 || r.height <= 0) continue;
+                                const s = getComputedStyle(el);
+                                if (s.visibility === 'hidden' || s.display === 'none') continue;
+                                if (!best || r.width * r.height < best.area) {
+                                    best = {
+                                        x: r.x + r.width / 2,
+                                        y: r.y + r.height / 2,
+                                        area: r.width * r.height
+                                    };
+                                }
+                            }
+                        }
+                        return best;
+                    }
+                """
+                for _ in range(6):
+                    option_box = await self.page.evaluate(find_option_js, target_texts)
+                    if option_box:
                         break
-                except:
-                    continue
+                    await self.page.wait_for_timeout(500)
+                if option_box:
+                    break
+                logger.info(f"Menu did not open or option missing (attempt {attempt + 1}/4)")
+                # SAFETY: only press Escape when a menu is ACTUALLY open.
+                # With no menu open, Escape falls through to the post dialog
+                # and CLOSES THE POST entirely (observed in production).
+                menu_open = await self.page.evaluate(
+                    """() => {
+                        for (const m of document.querySelectorAll('[role="menu"]')) {
+                            const r = m.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) return true;
+                        }
+                        return false;
+                    }"""
+                )
+                if menu_open:
+                    await self.page.keyboard.press('Escape')
+                    await self.page.wait_for_timeout(500)
+                else:
+                    await self.page.wait_for_timeout(500)
             
-            if not target_option:
+            if not option_box:
                 logger.warning(f"Could not find '{mode}' option in menu")
                 await self._take_screenshot("04_no_option")
+                # Same Escape guard as above — never risk closing the post dialog.
+                menu_open = await self.page.evaluate(
+                    """() => {
+                        for (const m of document.querySelectorAll('[role="menu"]')) {
+                            const r = m.getBoundingClientRect();
+                            if (r.width > 0 && r.height > 0) return true;
+                        }
+                        return false;
+                    }"""
+                )
+                if menu_open:
+                    await self.page.keyboard.press('Escape')
                 return False
             
-            # Click the sorting option
-            await target_option.click()
+            logger.info(f"Found '{mode}' option, clicking at ({option_box['x']:.0f}, {option_box['y']:.0f})")
+            
+            # STEP 3: Click the option via coordinates and verify the switch.
+            await self.page.mouse.click(option_box['x'], option_box['y'])
             await self.page.wait_for_timeout(self.config['browser']['timings']['sorting_mode_switch'])
             await self._take_screenshot(f"05_switched_to_{mode}")
             
-            logger.info(f"Successfully switched to '{mode}' view")
-            return True
+            # STEP 3: Verify the trigger now displays the target mode
+            now_showing = await self.page.evaluate(
+                """
+                (targetTexts) => {
+                    const candidates = document.querySelectorAll(
+                        'div[role="button"], span[role="button"], [aria-haspopup="menu"]'
+                    );
+                    for (const el of candidates) {
+                        const text = (el.textContent || '').trim();
+                        if (text && text.length <= 60 && targetTexts.some(t => text === t || text.endsWith(' ' + t))) {
+                            return text;
+                        }
+                    }
+                    return null;
+                }
+                """,
+                target_texts
+            )
+            
+            if now_showing:
+                logger.info(f"Successfully switched to '{mode}' view (trigger shows: {now_showing})")
+                return True
+            
+            logger.warning(f"Clicked option but trigger does not show target mode yet")
+            return False
             
         except Exception as e:
             logger.error(f"Error switching to most recent: {e}")
@@ -677,6 +852,72 @@ class FacebookScraper:
             except Exception as e:
                 logger.debug(f"Error closing separate session: {e}")
     
+    async def _find_visible_comment_box(self, max_wait_ms: int = 10000):
+        """Find the visible comment input box, preferring the one inside the post dialog.
+        
+        FB renders the post twice (dialog + background feed copy). A plain
+        query_selector can return a hidden/offscreen duplicate, so filter by
+        visibility, prefer in-dialog matches, and poll until timeout (the box
+        may not exist yet right after login/navigation while React hydrates).
+        """
+        find_js = """
+        () => {
+            const sels = [
+                'div[aria-label*="Write a comment"]',
+                'div[aria-label*="เขียนความคิดเห็น"]',
+                'div[aria-label*="ความคิดเห็น"]',
+                'div[contenteditable="true"][role="textbox"]',
+                'div[data-lexical-editor="true"]',
+            ];
+            const isVisible = (el) => {
+                const rect = el.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return false;
+                return el.offsetParent !== null || el.getClientRects().length > 0;
+            };
+            const candidates = [];
+            for (const sel of sels) {
+                for (const el of document.querySelectorAll(sel)) {
+                    if (!isVisible(el)) continue;
+                    const ce = el.getAttribute('contenteditable');
+                    const role = el.getAttribute('role');
+                    if (ce !== 'true' && role !== 'textbox') continue;
+                    const rect = el.getBoundingClientRect();
+                    candidates.push({
+                        el,
+                        inDialog: !!el.closest('div[role="dialog"]'),
+                        area: rect.width * rect.height,
+                    });
+                }
+            }
+            if (candidates.length === 0) return false;
+            candidates.sort((a, b) => (b.inDialog - a.inDialog) || (a.area - b.area));
+            const best = candidates[0].el;
+            best.setAttribute('data-comment-box-marker', '1');
+            best.scrollIntoView({block: 'center', behavior: 'instant'});
+            return true;
+        }
+        """
+        elapsed = 0
+        interval = 400
+        while elapsed < max_wait_ms:
+            try:
+                marked = await self.page.evaluate(find_js)
+                if marked:
+                    handle = await self.page.query_selector('[data-comment-box-marker="1"]')
+                    if handle:
+                        try:
+                            await self.page.evaluate(
+                                "document.querySelector('[data-comment-box-marker=\"1\"]')?.removeAttribute('data-comment-box-marker')"
+                            )
+                        except Exception:
+                            pass
+                        return handle
+            except Exception as e:
+                logger.debug(f"Comment box finder attempt failed: {e}")
+            await self.page.wait_for_timeout(interval)
+            elapsed += interval
+        return None
+    
     async def post_comment(self, message: str) -> bool:
         """
         Post a comment on the current Facebook post using the monitoring session.
@@ -700,33 +941,18 @@ class FacebookScraper:
             await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             await self.page.wait_for_timeout(self.config['browser']['timings']['scroll_to_comment_box'])
             
-            # Find comment input box - try multiple selectors
+            # Find comment input box - poll for a VISIBLE box (FB renders the post
+            # twice: dialog + background feed; hidden duplicates break first-match)
             print("[DEBUG] Finding comment box...")
-            comment_box = None
-            selectors = [
-                'div[aria-label*="Write a comment"]',
-                'div[aria-label*="เขียนความคิดเห็น"]',
-                'div[contenteditable="true"][role="textbox"]',
-                'div[data-lexical-editor="true"]',
-            ]
-            
-            for selector in selectors:
-                try:
-                    print(f"[DEBUG] Trying selector: {selector}")
-                    comment_box = await self.page.query_selector(selector)
-                    if comment_box:
-                        print(f"[DEBUG] Found comment box with selector: {selector}")
-                        logger.info(f"Found comment box with selector: {selector}")
-                        break
-                except Exception as e:
-                    print(f"[DEBUG] Selector {selector} failed: {e}")
-                    continue
+            comment_box = await self._find_visible_comment_box(max_wait_ms=10000)
             
             if not comment_box:
                 print("[DEBUG] ERROR: Could not find comment input box")
                 logger.error("Could not find comment input box")
                 await self._take_screenshot("error_no_comment_box")
                 return False
+            
+            logger.info("Found visible comment box")
             
             # Click to focus with force=True
             print("[DEBUG] Clicking comment box...")
@@ -1193,10 +1419,16 @@ class FacebookScraper:
                 await self.page.wait_for_timeout(1000)
             
             if not reply_box:
-                logger.warning("Could not find reply input box, assuming reply will work...")
-                await self.page.wait_for_timeout(2000)
-                logger.info(f"Assumed reply posted to comment {comment_id}")
-                return True
+                # Do NOT assume success. Verify whether the reply actually
+                # exists in the DOM before reporting the result.
+                logger.warning("Could not find reply input box - verifying DOM instead...")
+                verified = await self._verify_reply_in_dom(comment_id, message)
+                if verified:
+                    logger.info(f"Reply to comment {comment_id} verified in DOM (without textbox)")
+                    return True
+                logger.error(f"Reply box not found and reply NOT found in DOM for comment {comment_id}")
+                await self._take_screenshot("error_reply_box_not_found")
+                return False
             
             # Type the reply message
             await reply_box.click(force=True)
@@ -1258,13 +1490,123 @@ class FacebookScraper:
             
             await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_submit'])
             
-            logger.info(f"Reply posted successfully to comment {comment_id}")
+            # CRITICAL: Verify the reply actually appears in the DOM before
+            # reporting success. A false "success" causes the caller to mark
+            # the comment as replied and never retry it.
+            verified = await self._verify_reply_in_dom(comment_id, message)
+            if not verified:
+                logger.error(f"Reply to comment {comment_id} NOT found in DOM after submit")
+                await self._take_screenshot("error_reply_not_verified")
+                return False
+            
+            logger.info(f"Reply posted and verified in DOM for comment {comment_id}")
             return True
             
         except Exception as e:
-            logger.warning(f"Exception while replying to comment {comment_id}: {e}")
-            logger.warning("Assuming reply succeeded anyway...")
-            return True
+            logger.error(f"Exception while replying to comment {comment_id}: {e}")
+            # Even on exception, verify before deciding the outcome
+            try:
+                verified = await self._verify_reply_in_dom(comment_id, message)
+                if verified:
+                    logger.info(f"Reply verified in DOM despite exception for comment {comment_id}")
+                    return True
+            except Exception as verify_error:
+                logger.error(f"DOM verification also failed: {verify_error}")
+            return False
+    
+    async def _verify_reply_in_dom(self, comment_id: str, message: str, max_wait_ms: int = 12000) -> bool:
+        """Verify that a reply actually exists in the DOM under the target comment.
+        
+        Polls the DOM for up to max_wait_ms because Facebook updates the
+        comment thread asynchronously after submit — a single immediate check
+        races against the re-render and produces false negatives.
+        
+        Args:
+            comment_id: The Facebook comment ID that was replied to
+            message: The reply message text that should appear
+            max_wait_ms: Total time to keep polling before giving up
+            
+        Returns:
+            True if the reply text is found in a visible, non-editable node
+            inside an article (strongest when the article is nested within
+            another article, i.e. a reply under its parent)
+        """
+        poll_interval_ms = 500
+        elapsed_ms = 0
+        last_error = 'unknown'
+        
+        while True:
+            try:
+                result = await self.page.evaluate(
+                    """([commentId, replyMessage]) => {
+                    try {
+                        const needle = replyMessage.substring(0, 20);
+                        // On group permalink pages Facebook often renders NO
+                        // comment_id links at all (probe confirmed linksTotal=0),
+                        // so anchoring on the parent comment is unreliable.
+                        // Instead look for the reply TEXT itself in visible,
+                        // non-editable nodes:
+                        //   - best evidence: inside an article nested within
+                        //     another article (a reply under its parent)
+                        //   - acceptable: inside any article (flat rendering)
+                        // Text still sitting in the contenteditable input is
+                        // explicitly ignored to avoid false positives.
+                        const vis = (el) => {
+                            const r = el.getBoundingClientRect();
+                            return r.height > 0 && r.width > 0;
+                        };
+                        const leaves = document.querySelectorAll('div, span');
+                        let nestedHit = false;
+                        let articleHit = 0;
+                        for (const el of leaves) {
+                            if (el.childElementCount !== 0) continue;
+                            if (!vis(el)) continue;
+                            if (el.isContentEditable || el.closest('[contenteditable="true"]')) continue;
+                            const txt = el.innerText || '';
+                            if (!txt.includes(needle)) continue;
+                            const art = el.closest('div[role="article"]');
+                            if (!art) continue;
+                            articleHit++;
+                            let p = art.parentElement;
+                            while (p) {
+                                if (p.getAttribute && p.getAttribute('role') === 'article' && vis(p)) {
+                                    nestedHit = true;
+                                    break;
+                                }
+                                p = p.parentElement;
+                            }
+                            if (nestedHit) break;
+                        }
+                        if (nestedHit) return { success: true, mode: 'nested_article' };
+                        if (articleHit > 0) return { success: true, mode: 'article_text', count: articleHit };
+                        return { success: false, error: 'reply_text_not_found' };
+                    } catch (e) {
+                        return { success: false, error: e.toString() };
+                    }
+                }""", [comment_id, message]
+                )
+                
+                if result.get('success'):
+                    logger.debug(
+                        f"DOM verification passed after {elapsed_ms}ms: "
+                        f"mode={result.get('mode', 'unknown')}"
+                    )
+                    return True
+                last_error = result.get('error', 'unknown')
+                
+            except Exception as e:
+                # Page/browser closing — do not spin until the timeout
+                logger.error(f"Error verifying reply in DOM: {e}")
+                return False
+            
+            if elapsed_ms >= max_wait_ms:
+                break
+            
+            await asyncio.sleep(poll_interval_ms / 1000.0)
+            elapsed_ms += poll_interval_ms
+        
+        logger.debug(f"DOM verification failed after {max_wait_ms}ms: {last_error}")
+        return False
     
     async def close(self) -> None:
         """Close browser and cleanup."""

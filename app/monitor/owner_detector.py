@@ -45,7 +45,6 @@ class OwnerCommentDetector:
         self.use_mutation_observer = True
         self.scan_count = 0  # Track scan count for periodic page reload
         self.last_reload_time = 0  # Track last reload timestamp
-        self.scan_count = 0  # Track scan count for periodic page reload
         
         # Callbacks
         self.on_owner_comment = None
@@ -96,7 +95,6 @@ class OwnerCommentDetector:
                 logger.info("OK MutationObserver installed for real-time detection")
             
             # Initialize last reload time
-            import time
             self.last_reload_time = time.time()
             
             # Seed bot_reply_texts with the configured reply message so the bot
@@ -136,6 +134,13 @@ class OwnerCommentDetector:
             await self.page.reload(wait_until="domcontentloaded")
             await asyncio.sleep(0.5)
             self.last_reload_time = time.time()
+            
+            # CRITICAL: Reload wipes the JS context, so the MutationObserver
+            # installed in initialize() is gone. Reinstall it now.
+            if self.use_mutation_observer:
+                await self._install_mutation_observer()
+                logger.info("MutationObserver reinstalled after initial reload")
+            
             logger.info("Hard reload complete - ready for fresh comments")
             
         except Exception as e:
@@ -371,7 +376,6 @@ class OwnerCommentDetector:
         try:
             # Smart reload: Only when MutationObserver detects changes but scan finds nothing new
             # This means Facebook has new comments but they're not in DOM yet
-            import time
             current_time = time.time()
             
             # Reload if: 10+ seconds since last reload AND we haven't seen new comments
@@ -379,6 +383,10 @@ class OwnerCommentDetector:
                 await self.page.reload(wait_until="domcontentloaded")
                 self.last_reload_time = current_time
                 await asyncio.sleep(0.3)  # Reduced wait time
+                
+                # Reload wipes the JS context - reinstall MutationObserver
+                if self.use_mutation_observer:
+                    await self._install_mutation_observer()
                 
                 # Aggressive scroll after reload to force Facebook to load new comments
                 await self.page.evaluate("""
@@ -499,6 +507,10 @@ class OwnerCommentDetector:
             
         except Exception as e:
             logger.error(f"Error getting top N comments: {e}")
+            # Do not swallow closed-browser errors: monitor_loop must see them
+            # so it can exit and trigger cleanup instead of spinning forever.
+            if 'has been closed' in str(e) or 'Target closed' in str(e):
+                raise
             return []
     
     async def reply_instantly(self, comment_id: str, message: str) -> bool:
@@ -656,10 +668,8 @@ class OwnerCommentDetector:
         refresh_interval_ms = self.config.get('monitor', {}).get('refresh_interval', 200)
         refresh_interval = refresh_interval_ms / 1000.0
         
-        auto_reply_enabled = self.config.get('auto_reply', {}).get('enabled', False)
-        reply_message = self.config.get('auto_reply', {}).get('reply_message', '')
-        
         logger.info("MONITORING STARTED")
+        auto_reply_enabled = self.config.get('auto_reply', {}).get('enabled', False)
         logger.info(f"   Scan interval: {refresh_interval_ms}ms | Owner: {self.owner_name} | Auto-reply: {'ON' if auto_reply_enabled else 'OFF'}")
         
         scan_count = 0
@@ -680,6 +690,11 @@ class OwnerCommentDetector:
                 logger.info("Monitor loop stopped by user")
                 raise  # Re-raise to allow proper cleanup
             except Exception as e:
+                # If the browser/page is gone, the loop can never recover —
+                # exit so cleanup() runs instead of spinning error forever.
+                if 'has been closed' in str(e) or 'Target closed' in str(e):
+                    logger.error("Browser/page closed - stopping monitor loop")
+                    raise
                 logger.error(f"Error in monitor loop: {e}")
                 await asyncio.sleep(1.0)
     

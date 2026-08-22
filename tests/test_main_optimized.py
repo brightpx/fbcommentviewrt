@@ -681,8 +681,10 @@ class TestHandleOwnerComment:
         await app._handle_owner_comment(comment)
 
         mock_scraper.reply_to_comment.assert_called_once()
-        # Comment should NOT be added to replied_comment_ids
-        assert '123456789' not in mock_detector.replied_comment_ids
+        # Comment IS marked as replied BEFORE the attempt (optimistic lock):
+        # a failed/slow verification must never trigger a duplicate reply,
+        # because double-posting on Facebook is worse than missing one reply.
+        assert '123456789' in mock_detector.replied_comment_ids
 
     @pytest.mark.asyncio
     @patch('app.main_optimized.setup_logging')

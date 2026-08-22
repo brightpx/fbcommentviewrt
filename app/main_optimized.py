@@ -20,11 +20,13 @@ Architecture:
 import asyncio
 import logging
 import yaml
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 from .scraper.facebook import FacebookScraper
 from .monitor.owner_detector import OwnerCommentDetector
+from .database.db import CommentDatabase
 from .models.comment import Comment
 
 
@@ -91,6 +93,13 @@ class OptimizedFacebookAutoReply:
             print("   - Memory: 60% lower usage")
             print("=" * 60 + "\n")
             
+            # Initialize database
+            print("Initializing database...")
+            db_path = self.config.get('database', {}).get('path', 'database/comments.db')
+            self.db = CommentDatabase(db_path)
+            await self.db.initialize()
+            print(f"OK Database initialized: {db_path}\n")
+
             # Initialize scraper
             print("Initializing browser...")
             self.scraper = FacebookScraper(self.config)
@@ -158,7 +167,24 @@ class OptimizedFacebookAutoReply:
             print(f"ERROR: Initialization failed: {e}")
             return False
     
-    async def run(self) -> None:
+    async def post_test_comment(self, message: Optional[str] = None) -> bool:
+        """Post a test comment through the already initialized monitor session."""
+        if not self.scraper:
+            logger.error("Cannot post test comment before initialization")
+            return False
+
+        test_message = message or f"TEST_FUNCTION_COMMENT_{datetime.now().strftime('%H%M%S')}"
+        print(f"Posting test comment in the monitor session: {test_message}")
+        success = await self.scraper.post_comment(test_message)
+        if success:
+            print(f"OK Test comment posted: {test_message}")
+            logger.info(f"Test comment posted in monitor session: {test_message}")
+        else:
+            print("ERROR: Test comment was not posted")
+            logger.error("Test comment posting failed")
+        return success
+
+    async def run(self, post_test_message: Optional[str] = None) -> None:
         """Run the optimized monitoring loop."""
         if not await self.initialize():
             logger.error("Cannot start - initialization failed")
@@ -171,6 +197,10 @@ class OptimizedFacebookAutoReply:
             print("Waiting for owner comments...")
             print("Press Ctrl+C to stop")
             print("=" * 60 + "\n")
+
+            if post_test_message is not None:
+                await self.post_test_comment(post_test_message)
+                print("Test post completed; monitoring continues in the same session.\n")
             
             logger.info("Starting owner comment monitoring")
             
@@ -227,18 +257,19 @@ class OptimizedFacebookAutoReply:
             
             logger.info(f"Posting reply: {reply_message[:50]}...")
             
+            # Optimistically mark as replied BEFORE attempting, so a slow or
+            # failed verification never triggers a duplicate reply attempt.
+            # If the reply truly failed we log it for manual follow-up instead
+            # of risking double-posting the same message twice.
+            self.detector.replied_comment_ids.add(comment_id)
+            
             # Post reply using scraper
             success = await self.scraper.reply_to_comment(comment_id, reply_message)
             
             if success:
                 logger.info(f"SUCCESS: Reply posted to comment {comment_id}")
                 
-                # Mark as replied to prevent duplicate replies
-                self.detector.replied_comment_ids.add(comment_id)
-                logger.info(f"Marked {comment_id} as replied (total: {len(self.detector.replied_comment_ids)})")
-                
                 # Register bot reply text to prevent self-reply loop
-                # (Facebook shows bot's own reply as a new comment from owner)
                 self.detector.add_bot_reply_text(reply_message)
                 logger.info(f"Registered bot reply text to prevent self-reply loop")
                 
@@ -264,6 +295,9 @@ class OptimizedFacebookAutoReply:
     async def cleanup(self) -> None:
         """Cleanup resources."""
         try:
+            if self.db:
+                await self.db.close()
+                logger.info("Database closed")
             if self.scraper:
                 await self.scraper.save_session()
                 if self.scraper.browser:
@@ -275,10 +309,10 @@ class OptimizedFacebookAutoReply:
             logger.error(f"Cleanup error: {e}")
 
 
-async def main():
+async def main(post_test_message: Optional[str] = None):
     """Main entry point for optimized version."""
     app = OptimizedFacebookAutoReply()
-    await app.run()
+    await app.run(post_test_message=post_test_message)
 
 
 if __name__ == "__main__":

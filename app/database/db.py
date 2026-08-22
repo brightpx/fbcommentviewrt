@@ -73,6 +73,50 @@ class CommentDatabase:
         )
         await self.conn.commit()
     
+    async def add_comment(
+        self,
+        comment_id: str,
+        post_url: str,
+        author: str,
+        text: str,
+        is_owner: bool = False,
+        replied: bool = False,
+        parent_id: Optional[str] = None,
+        tier: int = 1
+    ) -> None:
+        """Save a comment using simple keyword arguments.
+
+        Convenience wrapper used by the optimized monitor when a reply
+        succeeds. Stores the comment with reply metadata in display_order
+        (replied flag) so it can be audited later.
+
+        Args:
+            comment_id: Facebook comment ID
+            post_url: URL of the post the comment belongs to
+            author: Comment author name
+            text: Comment message text
+            is_owner: True if the comment is from the post owner
+            replied: True if the bot has replied to this comment
+            parent_id: Parent comment ID (for replies)
+            tier: Comment tier (1 = top-level, 2 = first-level reply)
+        """
+        now = datetime.now()
+        comment = Comment(
+            id=comment_id,
+            parent_id=parent_id,
+            tier=tier,
+            author=author,
+            message=text,
+            created_time=now,
+            last_seen=now,
+            # Reuse display_order as a "replied" marker (0 = not replied, 1 = replied)
+            display_order=1 if replied else 0,
+            is_new=False,
+            children=[]
+        )
+        await self.save_comment(comment, post_url)
+        logger.debug(f"add_comment: saved {comment_id} (owner={is_owner}, replied={replied})")
+
     async def save_comments_batch(self, comments: List[Comment], post_url: str) -> None:
         """Save multiple comments in a batch."""
         data = [
