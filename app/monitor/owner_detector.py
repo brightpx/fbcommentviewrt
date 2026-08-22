@@ -45,6 +45,12 @@ class OwnerCommentDetector:
         self.use_mutation_observer = True
         self.scan_count = 0  # Track scan count for periodic page reload
         self.last_reload_time = 0  # Track last reload timestamp
+        # MEASURED (2026-08-22): passive push delivers new comments ~2.4s after
+        # posting, so periodic reload is only a safety-net now. Default 120s
+        # (was 10s hard reload - the source of V5's ~10s detection latency).
+        self.reload_interval_s = int(
+            self.config.get('monitor', {}).get('reload_interval_s', 120)
+        )
         
         # Callbacks
         self.on_owner_comment = None
@@ -135,6 +141,13 @@ class OwnerCommentDetector:
             await asyncio.sleep(0.5)
             self.last_reload_time = time.time()
             
+            # CRITICAL (2026-08-22): Facebook resets comment sorting back to
+            # its default ("ความคิดเห็นทั้งหมด") on EVERY reload, undoing the
+            # switch_to_most_recent() done earlier in initialize(). Re-apply
+            # it BEFORE reinstalling the observer (the switch churns the DOM
+            # and would otherwise flood the fresh observer with noise).
+            await self._reapply_sort_mode_after_reload()
+            
             # CRITICAL: Reload wipes the JS context, so the MutationObserver
             # installed in initialize() is gone. Reinstall it now.
             if self.use_mutation_observer:
@@ -146,8 +159,44 @@ class OwnerCommentDetector:
         except Exception as e:
             logger.warning(f"Initial scan failed: {e}")
     
+    async def _reapply_sort_mode_after_reload(self) -> None:
+        """Re-apply the configured comment sorting mode after a page reload.
+        
+        MEASURED (2026-08-22, production log): Facebook resets comment sorting
+        to its default ("ความคิดเห็นทั้งหมด" / All comments) on EVERY reload.
+        Without this call the page silently falls back to "All comments" after
+        the initial hard reload and after every periodic safety-net reload,
+        hiding the newest comments from BOTH the user's visible screen AND the
+        DOM scan (newest-first ordering is required for top-N detection).
+        """
+        sorting_mode = self.config.get('monitor', {}).get('sorting_mode', 'most_recent')
+        if not sorting_mode or sorting_mode == 'none':
+            return
+        try:
+            switched = await self.scraper.switch_sorting_mode(sorting_mode)
+            if switched:
+                logger.info(f"OK Re-applied '{sorting_mode}' sorting after reload")
+            else:
+                # Non-fatal: switch_sorting_mode already retried ~6x; the next
+                # safety-net reload will try again.
+                logger.warning(
+                    f"Could not re-apply '{sorting_mode}' sorting after reload "
+                    f"(will retry at next safety-net reload)"
+                )
+        except Exception as e:
+            logger.warning(f"Error re-applying sort mode after reload: {e}")
+    
     async def _install_mutation_observer(self) -> None:
-        """Install MutationObserver to detect new comments in real-time."""
+        """Install MutationObserver to detect new comments in real-time.
+        
+        MEASURED FACT (2026-08-22, measure_refresh.py, n=4): Facebook delivers
+        remote comments passively ~2.4s after posting, but inserts them as a
+        PLAIN DIV wrapper + characterData fill - it does NOT append
+        div[role=article] or comment_id links as new nodes. The old observer
+        (article/comment_id-only) therefore NEVER fired and the bot fell back
+        to its 10s reload policy. This observer watches ALL node additions +
+        text changes near the comment feed instead.
+        """
         try:
             await self.page.evaluate("""
                 () => {
@@ -156,36 +205,37 @@ class OwnerCommentDetector:
                     }
                     
                     window.__newCommentIds = window.__newCommentIds || [];
+                    window.__feedActivity = 0;
                     
                     const observer = new MutationObserver((mutations) => {
                         for (const mutation of mutations) {
+                            // Track text changes anywhere (FB fills the new
+                            // comment's content via characterData updates).
+                            if (mutation.type === 'characterData') {
+                                window.__feedActivity++;
+                                continue;
+                            }
+                            
                             for (const node of mutation.addedNodes) {
-                                if (node.nodeType === 1) {
-                                    // Check if this is a comment article
-                                    if (node.getAttribute && node.getAttribute('role') === 'article') {
-                                        const link = node.querySelector('a[href*="comment_id="]');
-                                        if (link) {
-                                            const match = link.href.match(/comment_id=(\\d+)/);
-                                            if (match && !window.__newCommentIds.includes(match[1])) {
-                                                window.__newCommentIds.push(match[1]);
-                                                console.log('[OwnerDetector] New comment detected:', match[1]);
-                                            }
-                                        }
-                                    }
-                                    
-                                    // Also check children
-                                    if (node.querySelectorAll) {
-                                        const articles = node.querySelectorAll('[role="article"]');
-                                        articles.forEach(article => {
-                                            const link = article.querySelector('a[href*="comment_id="]');
-                                            if (link) {
-                                                const match = link.href.match(/comment_id=(\\d+)/);
-                                                if (match && !window.__newCommentIds.includes(match[1])) {
-                                                    window.__newCommentIds.push(match[1]);
-                                                    console.log('[OwnerDetector] New comment detected (child):', match[1]);
-                                                }
-                                            }
-                                        });
+                                if (node.nodeType !== 1) continue;
+                                window.__feedActivity++;
+                                
+                                // Path A: a real article node appeared (some FB
+                                // surfaces still do this) - extract its ID.
+                                let articles = [];
+                                if (node.getAttribute && node.getAttribute('role') === 'article') {
+                                    articles.push(node);
+                                }
+                                if (node.querySelectorAll) {
+                                    articles = articles.concat(Array.from(node.querySelectorAll('[role="article"]')));
+                                }
+                                for (const article of articles) {
+                                    const link = article.querySelector('a[href*="comment_id="]');
+                                    if (!link) continue;
+                                    const match = link.href.match(/comment_id=(\\d+)/);
+                                    if (match && !window.__newCommentIds.includes(match[1])) {
+                                        window.__newCommentIds.push(match[1]);
+                                        console.log('[OwnerDetector] New article detected:', match[1]);
                                     }
                                 }
                             }
@@ -196,10 +246,11 @@ class OwnerCommentDetector:
                     if (target) {
                         observer.observe(target, { 
                             childList: true, 
-                            subtree: true 
+                            subtree: true,
+                            characterData: true 
                         });
                         window.__ownerDetectorObserver = observer;
-                        console.log('[OwnerDetector] MutationObserver installed');
+                        console.log('[OwnerDetector] Broad MutationObserver installed');
                     }
                 }
             """)
@@ -227,7 +278,11 @@ class OwnerCommentDetector:
             if mutation_ids:
                 logger.info(f"MutationObserver detected {len(mutation_ids)} new comment(s)")
             
-            # Step 2: Get TOP 20 newest comments to check for new ones
+            # Step 2: Get TOP 20 newest comments to check for new ones.
+            # MEASURED (2026-08-22): FB passively delivers new comments into the
+            # open page ~2.4s after posting (plain DIV + text fill), so a plain
+            # DOM scan is enough - NO reload, NO sort-mode toggle needed.
+            # The reload below is only a periodic safety-net for missed events.
             raw_comments = await self._get_top_n_comments(n=20)
             
             # [DEBUG] Log what we see with timestamp info
@@ -362,6 +417,21 @@ class OwnerCommentDetector:
         except:
             return []
     
+    async def _get_feed_activity(self) -> int:
+        """Read and reset the broad DOM-activity counter from the observer.
+        
+        Any node addition or text change in the page bumps this counter.
+        A non-zero delta means Facebook changed the feed since we last looked,
+        so a fresh scan is worthwhile WITHOUT reloading the page.
+        """
+        try:
+            return await self.page.evaluate(
+                "() => { const n = window.__feedActivity || 0; "
+                "window.__feedActivity = 0; return n; }"
+            )
+        except:
+            return 0
+    
     async def _get_top_n_comments(self, n: int = 5) -> List[Dict[str, Any]]:
         """Get top N comments using direct DOM query (NO BeautifulSoup).
         
@@ -374,15 +444,30 @@ class OwnerCommentDetector:
             List of raw comment dictionaries
         """
         try:
-            # Smart reload: Only when MutationObserver detects changes but scan finds nothing new
-            # This means Facebook has new comments but they're not in DOM yet
+            # MEASURED (2026-08-22): Facebook passively delivers new comments
+            # into the open page ~2.4s after posting, so reloading on a fixed
+            # timer is unnecessary and only adds ~7-10s of render downtime.
+            # New policy:
+            #   - Reload ONLY as a periodic safety-net (default 120s) in case
+            #     the observer missed an event or the feed went stale.
+            #   - Between safety-nets: cheap scroll-to-top + DOM scan; the
+            #     broad observer flags activity so scans stay meaningful.
             current_time = time.time()
             
-            # Reload if: 10+ seconds since last reload AND we haven't seen new comments
-            if current_time - self.last_reload_time > 10:
+            if current_time - self.last_reload_time > self.reload_interval_s:
+                logger.info(
+                    f"Safety-net reload triggered "
+                    f"({self.reload_interval_s}s since last reload)"
+                )
                 await self.page.reload(wait_until="domcontentloaded")
                 self.last_reload_time = current_time
                 await asyncio.sleep(0.3)  # Reduced wait time
+                
+                # CRITICAL: Facebook resets comment sorting to its default
+                # ("ความคิดเห็นทั้งหมด") on every reload - re-apply the
+                # configured mode BEFORE scanning, otherwise the feed shows
+                # "All comments" and newest comments fall out of top-N.
+                await self._reapply_sort_mode_after_reload()
                 
                 # Reload wipes the JS context - reinstall MutationObserver
                 if self.use_mutation_observer:
@@ -411,24 +496,21 @@ class OwnerCommentDetector:
                         return label && (label.includes('ความคิดเห็นจาก') || label.includes('Comment by'));
                     }});
                     
-                    // Further filter for TOP-LEVEL comments only (T1) - exclude nested articles (T2 replies)
-                    const topLevelComments = commentArticles.filter(article => {{
-                        // Check if this article is nested inside another article
-                        let parent = article.parentElement;
-                        while (parent) {{
-                            if (parent !== article && parent.getAttribute('role') === 'article') {{
-                                return false; // This is a nested article (T2), skip it
-                            }}
-                            parent = parent.parentElement;
-                        }}
-                        return true; // This is a top-level comment (T1)
-                    }});
+                    // MEASURED (2026-08-22): Facebook renders every T1 comment TWICE -
+                    // once NESTED inside the post's own article and once STANDALONE.
+                    // A passively-pushed new comment exists ONLY as the nested copy
+                    // until the next full render, so nesting must NOT be used to
+                    // decide T1 vs T2 (the old nesting filter silently dropped every
+                    // freshly-delivered comment until a reload re-rendered it).
+                    // T2 replies are identified SOLELY by reply_comment_id in the
+                    // permalink href; duplicate renders are removed by comment ID.
+                    const seenIds = new Set();
                     
                     const results = [];
                     
-                    // Process top N top-level comments
-                    for (let i = 0; i < Math.min(topLevelComments.length, topN); i++) {{
-                        const article = topLevelComments[i];
+                    // Process comment articles in DOM order (newest first)
+                    for (let i = 0; i < commentArticles.length && results.length < topN; i++) {{
+                        const article = commentArticles[i];
                         
                         // Extract author from aria-label
                         const ariaLabel = article.getAttribute('aria-label');
@@ -467,7 +549,8 @@ class OwnerCommentDetector:
                         // Check for reply first
                         const replyMatch = href.match(/reply_comment_id=(\\d+)/);
                         if (replyMatch) {{
-                            commentId = replyMatch[1];
+                            // T2 reply - skip (detector handles T1 only)
+                            continue;
                         }} else {{
                             const commentMatch = href.match(/comment_id=(\\d+)/);
                             if (commentMatch) {{
@@ -478,6 +561,12 @@ class OwnerCommentDetector:
                         if (!commentId) {{
                             continue;
                         }}
+                        
+                        // Dedupe: same comment rendered twice (nested + standalone)
+                        if (seenIds.has(commentId)) {{
+                            continue;
+                        }}
+                        seenIds.add(commentId);
                         
                         // Extract message (first dir=auto div with content)
                         let message = '';

@@ -20,6 +20,9 @@ session:
 # Monitor settings
 monitor:
   refresh_interval: 2000  # milliseconds (เวลาที่รอระหว่างการ refresh คอมเมนต์)
+  # Measured (2026-08-22): Facebook passively delivers new comments ~2.4s after
+  # posting, so frequent reloads are unnecessary. Reload is only a safety-net.
+  reload_interval_s: 120  # seconds between safety-net page reloads
   max_comments: 10000
   enable_notifications: true
   sorting_mode: "most_recent"  # Options: "most_recent" (ใหม่ล่าสุด), "most_relevant" (เกี่ยวข้องมากที่สุด), "all" (ทั้งหมด), "none" (ไม่เปลี่ยนการเรียง)

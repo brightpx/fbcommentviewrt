@@ -1,0 +1,47 @@
+{
+  "observer_ready_wall": 1787385190.5802636,
+  "submit_wall": 1787385202.8993266,
+  "posted": true,
+  "poster_echo": true,
+  "phaseA_hit_info": {
+    "found": true,
+    "ariaLabel": "ความคิดเห็นจาก Possawee Dechsaradecho เมื่อ ไม่กี่วินาทีที่แ",
+    "rect": {
+      "x": 603,
+      "y": 957,
+      "w": 700,
+      "h": 69
+    },
+    "inViewport": true,
+    "hasLink": true
+  },
+  "raw_mutations": [
+    {
+      "t": 2286,
+      "added": 0,
+      "removed": 1,
+      "samples": [],
+      "charsDelta": 0
+    },
+    {
+      "t": 14537,
+      "added": 1,
+      "removed": 0,
+      "samples": [
+        "DIV",
+        "CHAR_DATA"
+      ],
+      "charsDelta": 3
+    }
+  ],
+  "phaseA": [],
+  "phaseA_hit": true,
+  "phaseA_hit_wall": 1787385205.260562,
+  "toggle_ok": true,
+  "phaseB": [],
+  "phaseB_start": 1787385205.2628405,
+  "phaseB_hit": true,
+  "phaseB_hit_wall": 1787385208.5436535,
+  "phaseC_start": 1787385208.5438604,
+  "phaseC_hit": false
+}
