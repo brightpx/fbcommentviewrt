@@ -27,10 +27,25 @@ class FacebookScraper:
         self.playwright = await async_playwright().start()
         
         browser_config = self.config['browser']
+        # Speed (2026-08-23): trim background work we never use.
         self.browser = await self.playwright.chromium.launch(
             headless=browser_config['headless'],
-            slow_mo=browser_config['slow_mo']
+            slow_mo=browser_config['slow_mo'],
+            args=[
+                '--disable-dev-shm-usage',
+                '--disable-background-networking',
+                '--disable-component-update',
+                '--disable-default-apps',
+                '--disable-extensions',
+                '--disable-sync',
+                '--disable-translate',
+                '--mute-audio',
+                '--no-first-run',
+                '--no-default-browser-check',
+            ],
         )
+        # Media blocking toggle (config browser.block_images, default true)
+        self.block_media = bool(browser_config.get('block_images', True))
         
         # Try to load existing session
         if Path(self.session_file).exists():
@@ -43,24 +58,47 @@ class FacebookScraper:
         else:
             await self._create_new_context()
     
+    async def _install_speed_routes(self) -> None:
+        """Block heavy resources (images / video / fonts) to speed up loads.
+
+        Login / checkpoint / captcha URLs are EXEMPTED so a manual re-login
+        with CAPTCHA still renders correctly (this was why blanket image
+        blocking was removed before).
+        """
+        if not getattr(self, 'block_media', True):
+            return
+
+        exempt_markers = ('login', 'checkpoint', 'captcha', 'recaptcha')
+
+        async def _speed_route(route):
+            try:
+                req = route.request
+                url_l = req.url.lower()
+                if any(m in url_l for m in exempt_markers):
+                    await route.continue_()
+                    return
+                if req.resource_type in ('image', 'media', 'font'):
+                    await route.abort()
+                else:
+                    await route.continue_()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        await self.context.route('**/*', _speed_route)
+        logger.info("Speed mode: blocking images/media/fonts (login pages exempt)")
+
     async def _create_new_context(self) -> None:
         """Create new browser context."""
         self.context = await self.browser.new_context(
             viewport={'width': 1920, 'height': 1080},
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
-        
-        # Image blocking disabled to allow CAPTCHA during login
-        # async def block_images(route):
-        #     if route.request.resource_type == "image":
-        #         logger.debug(f"Blocking image: {route.request.url[:100]}")
-        #         await route.abort()
-        #     else:
-        #         await route.continue_()
-        # 
-        # await self.context.route("**/*", block_images)
-        # logger.info("Image blocking enabled for all images")
-        
+
+        await self._install_speed_routes()
+
         self.page = await self.context.new_page()
         self.page.set_default_timeout(self.config['browser']['timeout'])
     
@@ -74,18 +112,9 @@ class FacebookScraper:
             viewport={'width': 1920, 'height': 1080},
             user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
         )
-        
-        # Image blocking disabled to allow CAPTCHA during login
-        # async def block_images(route):
-        #     if route.request.resource_type == "image":
-        #         logger.debug(f"Blocking image: {route.request.url[:100]}")
-        #         await route.abort()
-        #     else:
-        #         await route.continue_()
-        # 
-        # await self.context.route("**/*", block_images)
-        # logger.info("Image blocking enabled for all images")
-        
+
+        await self._install_speed_routes()
+
         self.page = await self.context.new_page()
         self.page.set_default_timeout(self.config['browser']['timeout'])
     
@@ -1511,6 +1540,59 @@ class FacebookScraper:
                 await self.page.keyboard.press('Enter')
             
             await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_submit'])
+            
+            # NEW (2026-08-23): Facebook can hold the submit button in its
+            # "กำลังโพส.." (Posting...) state for several seconds. Starting
+            # the verification countdown inside that window burns most of the
+            # polling budget before FB even finishes, so first wait (max +5s)
+            # until the button leaves the posting state, THEN start verifying.
+            try:
+                posting_waited_ms = 0
+                while posting_waited_ms < 5000:
+                    btn_state = await self.page.evaluate("""
+                        () => {
+                            const dialogs = document.querySelectorAll('div[role="dialog"]');
+                            let popup = null;
+                            for (const d of dialogs) {
+                                const r = d.getBoundingClientRect();
+                                if (r.width < 1200 && r.height > 0 && d.offsetParent !== null) {
+                                    popup = d;
+                                    break;
+                                }
+                            }
+                            // Dialog gone means the submission finished and the
+                            // popup was dismissed (normal success path)
+                            if (!popup) return 'dialog-closed';
+                            const candidates = [
+                                'div[role="button"][aria-label="โพสต์ความคิดเห็น"]',
+                                'div[role="button"][aria-label="Post"]',
+                                'div[role="button"][aria-label^="โพสต์"]'
+                            ];
+                            for (const sel of candidates) {
+                                const btn = popup.querySelector(sel);
+                                if (!btn) continue;
+                                const label = btn.getAttribute('aria-label') || '';
+                                if (label.indexOf('กำลังโพส') !== -1 || /posting/i.test(label)) {
+                                    return 'posting';
+                                }
+                                return 'idle';
+                            }
+                            return 'no-button';
+                        }
+                    """)
+                    if btn_state != 'posting':
+                        if posting_waited_ms > 0:
+                            logger.info(f"'กำลังโพส..' state finished after +{posting_waited_ms}ms")
+                        break
+                    await self.page.wait_for_timeout(250)
+                    posting_waited_ms += 250
+                else:
+                    logger.warning(
+                        "Submit button still in 'กำลังโพส..' state after +5000ms "
+                        "- proceeding to DOM verification anyway"
+                    )
+            except Exception as posting_wait_err:
+                logger.debug(f"Posting-state wait skipped: {posting_wait_err}")
             
             # CRITICAL: Verify the reply actually appears in the DOM before
             # reporting success. A false "success" causes the caller to mark

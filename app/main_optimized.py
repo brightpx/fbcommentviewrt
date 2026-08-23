@@ -273,6 +273,11 @@ class OptimizedFacebookAutoReply:
             # finished. Fire-and-forget keeps scanning at full speed; the
             # optimistic replied_comment_ids.add above already prevents
             # duplicates, and _reply_task_done() re-marks on failure.
+            # SPEED (2026-08-23): mark a reply as in flight so monitor_loop
+            # pauses DOM scanning until it finishes — scanning during
+            # "กำลังโพสต์..." steals the page main thread from FB's submit
+            # pipeline and stretches the posting state (~4s observed).
+            self.detector.in_flight_replies += 1
             task = asyncio.create_task(self._do_reply(comment_id, author, text, reply_message))
             self._reply_tasks.add(task)
             task.add_done_callback(self._reply_task_done)
@@ -313,6 +318,9 @@ class OptimizedFacebookAutoReply:
     def _reply_task_done(self, task: asyncio.Task) -> None:
         """Discard finished background reply tasks and surface crashes."""
         self._reply_tasks.discard(task)
+        # SPEED: release the scan-pause regardless of success/failure/crash.
+        if getattr(self.detector, 'in_flight_replies', 0) > 0:
+            self.detector.in_flight_replies -= 1
         if not task.cancelled() and task.exception():
             logger.error(f"Reply task crashed: {task.exception()}")
     

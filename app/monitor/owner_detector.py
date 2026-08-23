@@ -40,11 +40,17 @@ class OwnerCommentDetector:
         self.monitoring_start_time: Optional[datetime] = None  # Track when monitoring started
         self.replied_comment_ids: Set[str] = set()  # Track comments we've already replied to
         self.bot_reply_texts: Set[str] = set()  # Track bot reply texts to prevent self-reply loop
+        # SPEED (2026-08-23): while a reply is in flight, Facebook's submit
+        # pipeline needs the page main thread. Our 200ms DOM scans + MutationObserver
+        # callbacks compete with it and stretch the "กำลังโพสต์..." state (~4s).
+        # The monitor loop checks this counter and pauses scanning until it hits 0.
+        self.in_flight_replies: int = 0
         
         # Performance settings
         self.use_mutation_observer = True
         self.scan_count = 0  # Track scan count for periodic page reload
         self.last_reload_time = 0  # Track last reload timestamp
+        self._last_logged_top_id = None  # SPEED: log scan details only when top ID changes
         # MEASURED (2026-08-22): passive push delivers new comments ~2.4s after
         # posting, so periodic reload is only a safety-net now. Default 120s
         # (was 10s hard reload - the source of V5's ~10s detection latency).
@@ -238,7 +244,10 @@ class OwnerCommentDetector:
                                 for (const article of articles) {
                                     const link = article.querySelector('a[href*="comment_id="]');
                                     if (!link) continue;
-                                    const match = link.href.match(/comment_id=(\\d+)/);
+                                    // FIX (2026-08-23): accept NON-NUMERIC ids too
+                                    // (profile pfbid posts) - digit-only regex
+                                    // dropped every comment on such pages.
+                                    const match = link.href.match(/comment_id=([^&#]+)/);
                                     if (match && !window.__newCommentIds.includes(match[1])) {
                                         window.__newCommentIds.push(match[1]);
                                         console.log('[OwnerDetector] New article detected:', match[1]);
@@ -295,11 +304,17 @@ class OwnerCommentDetector:
             # by the author check, but they still occupy window slots).
             raw_comments = await self._get_top_n_comments(n=30)
             
-            # [DEBUG] Log what we see with timestamp info
+            # [DEBUG] Log what we see with timestamp info.
+            # SPEED (2026-08-23): log only when the top ID CHANGES (new comment
+            # arrived) - logging every ~300ms scan produced 46k lines/hour and
+            # measurable file I/O overhead on the monitor loop.
             if raw_comments:
-                logger.debug(f"Found {len(raw_comments)} comments in scan")
-                for i, comment in enumerate(raw_comments[:5], 1):
-                    logger.debug(f"  [{i}] ID={comment.get('id')}, Author={comment.get('author')[:20]}..., Timestamp={comment.get('timestamp')}")
+                top_id = raw_comments[0].get('id')
+                if top_id != self._last_logged_top_id:
+                    self._last_logged_top_id = top_id
+                    logger.debug(f"Found {len(raw_comments)} comments in scan (top={top_id})")
+                    for i, comment in enumerate(raw_comments[:5], 1):
+                        logger.debug(f"  [{i}] ID={comment.get('id')}, Author={comment.get('author')[:20]}..., Timestamp={comment.get('timestamp')}")
             
             # Step 3: Filter for NEW owner comments using timestamp + author matching
             skipped_old = 0
@@ -364,7 +379,15 @@ class OwnerCommentDetector:
             # chronologically (monotonic snowflake IDs), so a HIGHER id is ALWAYS a
             # NEWER comment. Use comment ID (descending) as the primary sort key —
             # this is far more precise than the coarse relative timestamp.
-            candidate_comments.sort(key=lambda c: -int(c['comment_id']))
+            # FIX (2026-08-23): profile (pfbid) posts have NON-NUMERIC comment ids,
+            # which crashed int(). Non-numeric ids get a constant key so the
+            # STABLE sort keeps their DOM order (= newest first as scanned).
+            def _newest_first_key(cid: str):
+                if cid.isdigit():
+                    return (0, -int(cid))
+                return (1, 0)
+
+            candidate_comments.sort(key=lambda c: _newest_first_key(c['comment_id']))
             
             for cand in candidate_comments:
                 comment_id = cand['comment_id']
@@ -562,13 +585,19 @@ class OwnerCommentDetector:
                         const href = link.href;
                         let commentId = null;
                         
-                        // Check for reply first
-                        const replyMatch = href.match(/reply_comment_id=(\\d+)/);
+                        // Check for reply first.
+                        // FIX (2026-08-23): profile (pfbid) posts use NON-NUMERIC
+                        // comment ids, so the old digit-only regex silently
+                        // dropped EVERY comment on such pages (the scan stayed
+                        // empty forever). Capture any chars up to & or #.
+                        // NOTE: reply check MUST stay first because the string
+                        // reply_comment_id= contains comment_id= as substring.
+                        const replyMatch = href.match(/reply_comment_id=([^&#]+)/);
                         if (replyMatch) {{
                             // T2 reply - skip (detector handles T1 only)
                             continue;
                         }} else {{
-                            const commentMatch = href.match(/comment_id=(\\d+)/);
+                            const commentMatch = href.match(/comment_id=([^&#]+)/);
                             if (commentMatch) {{
                                 commentId = commentMatch[1];
                             }}
@@ -780,7 +809,12 @@ class OwnerCommentDetector:
         scan_count = 0
         while True:
             try:
-                # Detect new owner comments
+                # Detect new owner comments — but NOT while a reply is in
+                # flight. Scanning during "กำลังโพสต์..." steals the main
+                # thread from FB's submit pipeline and slows the post down.
+                if self.in_flight_replies > 0:
+                    await asyncio.sleep(1.0)
+                    continue
                 new_owner_comments = await self.detect_new_owner_comments()
                 
                 # Show periodic status every 300 scans (~60 seconds at 200ms intervals)
