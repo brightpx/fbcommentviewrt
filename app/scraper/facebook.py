@@ -333,9 +333,12 @@ class FacebookScraper:
                 )
                 if trigger_text:
                     break
+                # LATENCY (2026-08-23): was 2500ms — right after a reload this
+                # retry dominated recovery time (up to 6x2.5s=15s before the
+                # feed was usable). 900ms still gives React time to render.
                 logger.info(f"Sort trigger not rendered yet (attempt {attempt + 1}/6), scrolling and retrying...")
                 await self.page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await self.page.wait_for_timeout(2500)
+                await self.page.wait_for_timeout(900)
             
             if not trigger_text:
                 logger.warning("Could not find sorting dropdown button")
@@ -396,9 +399,9 @@ class FacebookScraper:
                          "ใหม่ล่าสุด", "Most recent", "ความคิดเห็นทั้งหมด", "All comments"])
                     if not box:
                         logger.warning(f"Sorting trigger disappeared (attempt {attempt + 1}/4)")
-                        await self.page.wait_for_timeout(1000)
+                        await self.page.wait_for_timeout(600)
                         continue
-                    await self.page.wait_for_timeout(300)
+                    await self.page.wait_for_timeout(150)
                     
                     # Escalating click strategies: plain coordinate click usually
                     # works; force-click handles overlay interference; keyboard
@@ -454,11 +457,11 @@ class FacebookScraper:
                         return best;
                     }
                 """
-                for _ in range(6):
+                for _ in range(8):
                     option_box = await self.page.evaluate(find_option_js, target_texts)
                     if option_box:
                         break
-                    await self.page.wait_for_timeout(500)
+                    await self.page.wait_for_timeout(300)
                 if option_box:
                     break
                 logger.info(f"Menu did not open or option missing (attempt {attempt + 1}/4)")
@@ -476,9 +479,9 @@ class FacebookScraper:
                 )
                 if menu_open:
                     await self.page.keyboard.press('Escape')
-                    await self.page.wait_for_timeout(500)
+                    await self.page.wait_for_timeout(300)
                 else:
-                    await self.page.wait_for_timeout(500)
+                    await self.page.wait_for_timeout(300)
             
             if not option_box:
                 logger.warning(f"Could not find '{mode}' option in menu")
@@ -1287,7 +1290,14 @@ class FacebookScraper:
             # "stale" popups closes the post page we're working on!
             # We only need to make sure we pick the RIGHT textbox after clicking reply.
             
-            # Try to expand "View more comments" if present
+            # Try to expand "View more comments" if present.
+            # FIX (2026-08-23): Playwright's click() defaults to a 30s timeout.
+            # When Facebook re-renders the feed mid-click the button detaches
+            # and the click blocks for the FULL 30s PER SELECTOR — the log
+            # showed two matching selectors stalling 2x30s (=60s) while the
+            # whole monitor loop was frozen. Expansion is best-effort: use a
+            # short explicit timeout and move on; the retry loop below already
+            # handles a comment that is still loading.
             try:
                 expand_selectors = [
                     'div[role="button"]:has-text("View more comments")',
@@ -1300,10 +1310,11 @@ class FacebookScraper:
                         expand_btn = await self.page.query_selector(selector)
                         if expand_btn and await expand_btn.is_visible():
                             logger.info("Found 'View more comments' button, clicking to expand...")
-                            await expand_btn.click()
+                            await expand_btn.click(timeout=3000)
                             await self.page.wait_for_timeout(self.config['auto_reply']['timings']['expand_comments'])
                             break
-                    except:
+                    except Exception as click_err:
+                        logger.debug(f"Expand click failed ({selector}): {click_err}")
                         continue
             except Exception as e:
                 logger.debug(f"No expand button found or error expanding: {e}")
@@ -1436,6 +1447,17 @@ class FacebookScraper:
             await reply_box.type(message, delay=self.config['auto_reply']['timings']['type_delay'])
             await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_type'])
             
+            # BASELINE (2026-08-23): snapshot how many visible non-editable
+            # nodes already contain the reply text BEFORE submitting. Very
+            # short messages ("f") cannot be confirmed by presence alone, so
+            # _verify_reply_in_dom compares the post-submit count against this
+            # baseline instead.
+            try:
+                baseline_matches = await self._count_reply_matches(message)
+            except Exception as baseline_err:
+                logger.debug(f"Reply baseline count failed: {baseline_err}")
+                baseline_matches = None
+            
             # Facebook reply dialog: submit via the Post button.
             # The button is a div[role="button"] with aria-label only (no text content):
             #   - Thai: aria-label="โพสต์ความคิดเห็น" (Post comment)
@@ -1493,9 +1515,14 @@ class FacebookScraper:
             # CRITICAL: Verify the reply actually appears in the DOM before
             # reporting success. A false "success" causes the caller to mark
             # the comment as replied and never retry it.
-            verified = await self._verify_reply_in_dom(comment_id, message)
+            verified = await self._verify_reply_in_dom(
+                comment_id, message, baseline_count=baseline_matches
+            )
             if not verified:
-                logger.error(f"Reply to comment {comment_id} NOT found in DOM after submit")
+                logger.error(
+                    f"Reply to comment {comment_id} NOT CONFIRMED in DOM after submit "
+                    f"(it may still have been posted - check manually)"
+                )
                 await self._take_screenshot("error_reply_not_verified")
                 return False
             
@@ -1514,7 +1541,41 @@ class FacebookScraper:
                 logger.error(f"DOM verification also failed: {verify_error}")
             return False
     
-    async def _verify_reply_in_dom(self, comment_id: str, message: str, max_wait_ms: int = 12000) -> bool:
+    async def _count_reply_matches(self, message: str) -> int:
+        """Count visible, non-editable DOM nodes currently containing the reply text.
+
+        Used as a BASELINE right before submitting a reply. Verification then
+        succeeds when the count INCREASES — the only reliable signal for very
+        short messages (e.g. "f") whose mere presence proves nothing, and for
+        replies Facebook renders inside the reply popup dialog WITHOUT any
+        role=article wrapper (production-proven false-negative source).
+        """
+        result = await self.page.evaluate(
+            """(replyMessage) => {
+                try {
+                    const needle = replyMessage.substring(0, 20);
+                    const vis = (el) => {
+                        const r = el.getBoundingClientRect();
+                        return r.height > 0 && r.width > 0;
+                    };
+                    let total = 0;
+                    for (const el of document.querySelectorAll('div, span')) {
+                        if (el.childElementCount !== 0) continue;
+                        if (!vis(el)) continue;
+                        if (el.isContentEditable || el.closest('[contenteditable="true"]')) continue;
+                        const txt = el.innerText || '';
+                        if (txt.includes(needle)) total++;
+                    }
+                    return total;
+                } catch (e) {
+                    return -1;
+                }
+            }""",
+            message
+        )
+        return int(result) if isinstance(result, int) else -1
+    
+    async def _verify_reply_in_dom(self, comment_id: str, message: str, max_wait_ms: int = 12000, baseline_count: Optional[int] = None) -> bool:
         """Verify that a reply actually exists in the DOM under the target comment.
         
         Polls the DOM for up to max_wait_ms because Facebook updates the
@@ -1558,12 +1619,14 @@ class FacebookScraper:
                         const leaves = document.querySelectorAll('div, span');
                         let nestedHit = false;
                         let articleHit = 0;
+                        let total = 0;
                         for (const el of leaves) {
                             if (el.childElementCount !== 0) continue;
                             if (!vis(el)) continue;
                             if (el.isContentEditable || el.closest('[contenteditable="true"]')) continue;
                             const txt = el.innerText || '';
                             if (!txt.includes(needle)) continue;
+                            total++;
                             const art = el.closest('div[role="article"]');
                             if (!art) continue;
                             articleHit++;
@@ -1577,22 +1640,36 @@ class FacebookScraper:
                             }
                             if (nestedHit) break;
                         }
-                        if (nestedHit) return { success: true, mode: 'nested_article' };
-                        if (articleHit > 0) return { success: true, mode: 'article_text', count: articleHit };
-                        return { success: false, error: 'reply_text_not_found' };
+                        return { total: total, articleHit: articleHit, nestedHit: nestedHit };
                     } catch (e) {
                         return { success: false, error: e.toString() };
                     }
                 }""", [comment_id, message]
                 )
                 
-                if result.get('success'):
+                article_hit = result.get('articleHit', 0) > 0
+                nested_hit = bool(result.get('nestedHit'))
+                count_now = result.get('total', -1)
+                if nested_hit or article_hit:
                     logger.debug(
                         f"DOM verification passed after {elapsed_ms}ms: "
-                        f"mode={result.get('mode', 'unknown')}"
+                        f"mode={'nested_article' if nested_hit else 'article_text'}"
                     )
                     return True
-                last_error = result.get('error', 'unknown')
+                if baseline_count is not None and count_now > baseline_count:
+                    # A NEW node containing the reply text appeared after
+                    # submit — proof of posting even when Facebook renders the
+                    # reply outside any role=article wrapper (e.g. inside the
+                    # still-open reply popup dialog).
+                    logger.debug(
+                        f"DOM verification passed after {elapsed_ms}ms: "
+                        f"match count {baseline_count} -> {count_now}"
+                    )
+                    return True
+                last_error = (
+                    f'reply_text_not_found (total={count_now}, '
+                    f'baseline={baseline_count})'
+                )
                 
             except Exception as e:
                 # Page/browser closing — do not spin until the timeout

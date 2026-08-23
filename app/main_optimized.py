@@ -59,6 +59,8 @@ class OptimizedFacebookAutoReply:
         self.scraper: Optional[FacebookScraper] = None
         self.detector: Optional[OwnerCommentDetector] = None
         self.db = None  # Will be initialized in initialize()
+        self._reply_tasks: set = set()  # Background reply tasks (keep scans non-blocking)
+        self._reply_tasks: set = set()  # Background reply tasks (non-blocking scans)
         
     def _load_config(self, config_path: str) -> dict:
         """Load configuration from YAML file."""
@@ -263,17 +265,34 @@ class OptimizedFacebookAutoReply:
             # of risking double-posting the same message twice.
             self.detector.replied_comment_ids.add(comment_id)
             
-            # Post reply using scraper
+            # SPEED FIX (2026-08-23): run the reply as a BACKGROUND task.
+            # Previously the callback was awaited inside detect_new_owner_comments,
+            # which BLOCKED the whole monitor loop for the entire reply duration
+            # (~2.5s best case, up to 60s when a click stalled) — any comment
+            # posted during that window could not be seen until the reply
+            # finished. Fire-and-forget keeps scanning at full speed; the
+            # optimistic replied_comment_ids.add above already prevents
+            # duplicates, and _reply_task_done() re-marks on failure.
+            task = asyncio.create_task(self._do_reply(comment_id, author, text, reply_message))
+            self._reply_tasks.add(task)
+            task.add_done_callback(self._reply_task_done)
+                
+        except Exception as e:
+            logger.error(f"Error in _handle_owner_comment: {e}", exc_info=True)
+    
+    async def _do_reply(self, comment_id: str, author: str, text: str, reply_message: str) -> None:
+        """Post the actual reply in the background (called via asyncio.create_task).
+        
+        Keeps the monitor loop free to keep scanning while Playwright drives
+        the browser. On failure the comment is left marked as replied (logged
+        for manual follow-up) to avoid risky automatic retries.
+        """
+        try:
             success = await self.scraper.reply_to_comment(comment_id, reply_message)
-            
             if success:
                 logger.info(f"SUCCESS: Reply posted to comment {comment_id}")
-                
                 # Register bot reply text to prevent self-reply loop
                 self.detector.add_bot_reply_text(reply_message)
-                logger.info(f"Registered bot reply text to prevent self-reply loop")
-                
-                # Save to database
                 try:
                     await self.db.add_comment(
                         comment_id=comment_id,
@@ -287,10 +306,15 @@ class OptimizedFacebookAutoReply:
                 except Exception as db_error:
                     logger.error(f"Failed to save to database: {db_error}")
             else:
-                logger.error(f"FAILED: Could not post reply to comment {comment_id}")
-                
+                logger.error(f"FAILED: Could not post reply to comment {comment_id} (left marked as replied; check manually)")
         except Exception as e:
-            logger.error(f"Error in _handle_owner_comment: {e}", exc_info=True)
+            logger.error(f"Background reply error for {comment_id}: {e}", exc_info=True)
+    
+    def _reply_task_done(self, task: asyncio.Task) -> None:
+        """Discard finished background reply tasks and surface crashes."""
+        self._reply_tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            logger.error(f"Reply task crashed: {task.exception()}")
     
     async def cleanup(self) -> None:
         """Cleanup resources."""

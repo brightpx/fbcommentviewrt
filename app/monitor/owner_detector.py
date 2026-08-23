@@ -48,8 +48,14 @@ class OwnerCommentDetector:
         # MEASURED (2026-08-22): passive push delivers new comments ~2.4s after
         # posting, so periodic reload is only a safety-net now. Default 120s
         # (was 10s hard reload - the source of V5's ~10s detection latency).
+        # TUNED DOWN to 45s (2026-08-23, production log): FB only pushes live
+        # comments for roughly the first minute after a page load — after that
+        # new comments NEVER enter the DOM until a reload (top comment ID was
+        # frozen for 74s at 12:57-12:58). A 120s safety-net therefore meant
+        # up to ~2 minutes of blindness; 45s caps worst-case latency while
+        # keeping reload churn low.
         self.reload_interval_s = int(
-            self.config.get('monitor', {}).get('reload_interval_s', 120)
+            self.config.get('monitor', {}).get('reload_interval_s', 45)
         )
         
         # Callbacks
@@ -278,12 +284,16 @@ class OwnerCommentDetector:
             if mutation_ids:
                 logger.info(f"MutationObserver detected {len(mutation_ids)} new comment(s)")
             
-            # Step 2: Get TOP 20 newest comments to check for new ones.
+            # Step 2: Get TOP 30 newest comments to check for new ones.
             # MEASURED (2026-08-22): FB passively delivers new comments into the
             # open page ~2.4s after posting (plain DIV + text fill), so a plain
             # DOM scan is enough - NO reload, NO sort-mode toggle needed.
             # The reload below is only a periodic safety-net for missed events.
-            raw_comments = await self._get_top_n_comments(n=20)
+            # 30 (was 20, 2026-08-23): headroom so an owner comment is not
+            # pushed out of the scan window when many OTHER people's comments
+            # interleave between scans (non-owner comments are filtered later
+            # by the author check, but they still occupy window slots).
+            raw_comments = await self._get_top_n_comments(n=30)
             
             # [DEBUG] Log what we see with timestamp info
             if raw_comments:
@@ -512,8 +522,14 @@ class OwnerCommentDetector:
                     for (let i = 0; i < commentArticles.length && results.length < topN; i++) {{
                         const article = commentArticles[i];
                         
-                        // Extract author from aria-label
-                        const ariaLabel = article.getAttribute('aria-label');
+                        // Extract author from aria-label.
+                        // FIX (2026-08-23): FB sometimes embeds newline chars
+                        // inside the aria-label between the author/timestamp
+                        // parts. The old single-line regexes then failed ->
+                        // author empty -> the freshly-pushed comment was
+                        // SILENTLY DROPPED from the scan until the next
+                        // reload. Collapse all whitespace before matching.
+                        const ariaLabel = (article.getAttribute('aria-label') || '').replace(/\s+/g, ' ');
                         let author = '';
                         
                         // Extract author and timestamp from aria-label
