@@ -1414,7 +1414,26 @@ class FacebookScraper:
             if reply_clicked != 'clicked':
                 logger.warning(f"Could not click reply button (result: {reply_clicked}), continuing anyway...")
             
-            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_click_reply'])
+            # SPEED (2026-08-23): replaced the fixed after_click_reply sleep
+            # with event-driven polling — proceed as soon as the popup
+            # dialog's textbox actually exists (max 3s), instead of always
+            # sleeping a fixed amount.
+            popup_ready = False
+            for _ in range(12):  # 12 x 250ms = 3s max
+                popup_ready = await self.page.evaluate(
+                    """() => {
+                        const dialogs = document.querySelectorAll('div[role="dialog"]');
+                        for (const d of dialogs) {
+                            if (d.getBoundingClientRect().width >= 1200) continue;
+                            if (d.offsetParent === null) continue;
+                            if (d.querySelector('div[contenteditable="true"][role="textbox"]')) return true;
+                        }
+                        return false;
+                    }"""
+                )
+                if popup_ready:
+                    break
+                await self.page.wait_for_timeout(250)
             
             # Now find the reply input box.
             # After clicking reply, Facebook opens a popup dialog (div[role="dialog"])
@@ -1470,11 +1489,12 @@ class FacebookScraper:
                 await self._take_screenshot("error_reply_box_not_found")
                 return False
             
-            # Type the reply message
+            # Type the reply message. SPEED (2026-08-23): before_type and
+            # after_type sleeps removed — typing into an already-focused
+            # contenteditable needs no settle time, and FB enables the submit
+            # button synchronously on input events.
             await reply_box.click(force=True)
-            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['before_type'])
             await reply_box.type(message, delay=self.config['auto_reply']['timings']['type_delay'])
-            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_type'])
             
             # BASELINE (2026-08-23): snapshot how many visible non-editable
             # nodes already contain the reply text BEFORE submitting. Very
@@ -1539,7 +1559,10 @@ class FacebookScraper:
                 logger.warning("Post button not found, falling back to Enter key...")
                 await self.page.keyboard.press('Enter')
             
-            await self.page.wait_for_timeout(self.config['auto_reply']['timings']['after_submit'])
+            # SPEED (2026-08-23): removed the fixed after_submit sleep. The
+            # posting-state poll below reacts to real UI state, and
+            # _verify_reply_in_dom polls the DOM itself — a blind 1s sleep
+            # here only delayed every successful reply.
             
             # NEW (2026-08-23): Facebook can hold the submit button in its
             # "กำลังโพส.." (Posting...) state for several seconds. Starting
