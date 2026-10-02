@@ -1,4 +1,9 @@
-"""Main application entry point."""
+"""Main application entry point (LEGACY full-monitor, archived).
+
+Archived: the optimized owner-detector in :mod:`app.main_optimized` is now
+the canonical entry point. This module is kept for reference only and is
+no longer wired to ``python -m app`` / ``run.py``.
+"""
 import asyncio
 import logging
 import sys

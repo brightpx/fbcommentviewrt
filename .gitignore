@@ -138,9 +138,20 @@ cython_debug/
 # Application specific
 session/fb_session.json
 database/*.db
+database/*.db-shm
+database/*.db-wal
 database/*.db-journal
 logs/*.log
+*.log
 config.yaml
+
+# Test / debug artifacts (generated at runtime, never commit)
+*_result.json
+*_log.txt
+*_output.txt
+temp_*.txt
+debug_*.html
+measure_*.json
 
 # IDE
 .vscode/

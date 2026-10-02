@@ -59,7 +59,6 @@ class OptimizedFacebookAutoReply:
         self.scraper: Optional[FacebookScraper] = None
         self.detector: Optional[OwnerCommentDetector] = None
         self.db = None  # Will be initialized in initialize()
-        self._reply_tasks: set = set()  # Background reply tasks (keep scans non-blocking)
         self._reply_tasks: set = set()  # Background reply tasks (non-blocking scans)
         
     def _load_config(self, config_path: str) -> dict:
@@ -131,6 +130,9 @@ class OptimizedFacebookAutoReply:
             # Initialize owner detector
             print("Initializing owner comment detector...")
             self.detector = OwnerCommentDetector(self.scraper, self.config)
+            # Persist every visible scan to DB so the web dashboard mirrors
+            # the full feed, not just bot-replied comments.
+            self.detector.db = self.db
             
             if not await self.detector.initialize(post_url):
                 print("ERROR: Failed to initialize detector")

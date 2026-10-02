@@ -72,7 +72,8 @@ display:
 
 1. Run the application:
 ```bash
-python -m app.main
+python run.py
+# or: python -m app
 ```
 
 2. A browser window will open to Facebook login page
@@ -89,10 +90,58 @@ target:
 
 2. Run the application:
 ```bash
-python -m app.main
+python run.py
+# or: python -m app
 ```
 
 3. The monitor will automatically start monitoring the configured post URL
+
+### Web Dashboard (read-only view)
+
+No login needed — shows data already collected in `database/comments.db`
+in a Facebook-like page (no browser automation):
+
+```bash
+python run_web.py
+# open http://127.0.0.1:5000
+```
+
+Features: FB-style post card + nested comment bubbles, owner / replied
+badges, sort (ใหม่ล่าสุด/เก่าสุดก่อน), search, filters (owner-only,
+unreplied-only, newly arrived), multi-post switcher, auto-refresh every
+3s, live stats sidebar. API: `/api/comments`, `/api/status`.
+
+Web extras: add new post links from the sidebar (`POST /api/posts`),
+adjustable auto-refresh interval (ms) + manual refresh button, and a
+per-comment **ตอบกลับ** button that queues a real browser auto-reply job
+(`POST /api/reply`, status at `/api/reply/<job_id>` — one job at a time,
+uses the saved FB session; parent comment is marked ตอบแล้ว on success).
+The button is blue on not-yet-replied comments and sends instantly with
+the configured default message (no extra confirm step); already-replied
+comments show a ตอบแล้ว tag. A **บันทึก** log card on the right records
+dashboard activity (new arrivals, replies, add/delete, errors), and a
+**สถานะโปรแกรม** card shows monitor running/stopped, headless or windowed
+browser mode, web/session/DB info plus a live mini-tail of the monitor log
+(API: `/api/monitor`).
+Note: adding a link registers it for viewing; the `run.py` monitor still
+collects only `target.post_url` from `config.yaml`.
+
+The monitor runs with a visible browser window (`browser.headless: false`
+in `config.yaml`) — minimize it, the web status card shows everything.
+Session is reused from `session/fb_session.json`.
+
+> 2026-10-02 finding: `headless: true` does **not** work — Facebook serves a
+> login wall and a dead one-tap page to headless Chromium, so the saved
+> session is rejected and login can never complete (verified with
+> screenshots). The monitor auto-clicks the one-tap "ดำเนินการต่อ" page
+> when it appears in headful mode.
+
+Detection speed (2026-10-02): ID-based incremental detection (`known_ids`
+loaded from DB at start, so restarts never reprocess history), seconds-level
+timestamp parsing ("เมื่อสักครู่", "30 วินาทีที่แล้ว", plus weeks/months/years
+mapped to large ages), fail-open for first-sight comments, and adaptive
+re-scan (50ms after DOM change instead of waiting out the full 200ms
+interval). Web poll default is 2000ms (adjustable per page).
 
 ### Supported URL Formats
 
@@ -159,26 +208,46 @@ Data persists across runs, allowing you to:
 ```
 fbcommentviewrt/
 ├── app/
-│   ├── main.py              # Main application entry point
-│   ├── __init__.py          # Package initialization
+│   ├── main_optimized.py      # Canonical entry point (owner-detector auto-reply)
+│   ├── main_legacy.py         # Archived full-monitor (reference only)
+│   ├── __main__.py            # `python -m app` → main_optimized
 │   │
 │   ├── models/
 │   │   └── comment.py       # Data models (Comment, PostInfo)
 │   │
 │   ├── scraper/
-│   │   ├── facebook.py      # Browser automation with Playwright
-│   │   └── parser.py        # HTML parsing and comment extraction
+│   │   ├── facebook.py      # Facade: FacebookScraper (backward-compatible import)
+│   │   ├── browser.py       # Browser lifecycle, session, login
+│   │   ├── navigator.py     # Navigation, sorting, comment expansion
+│   │   ├── poster.py        # Comment posting and replying
+│   │   └── parser.py        # HTML parsing (legacy monitor only)
 │   │
 │   ├── monitor/
-│   │   ├── detector.py      # Change detection and monitoring loop
-│   │   └── cache.py         # In-memory cache for diff detection
+│   │   ├── owner_detector.py  # Canonical: incremental owner-comment detector
+│   │   ├── detector.py        # Legacy full-monitor detector (with main_legacy)
+│   │   └── cache.py           # Legacy in-memory diff cache
 │   │
 │   ├── renderer/
-│   │   └── cli.py           # Rich-based CLI rendering
+│   │   └── cli.py           # Rich-based CLI renderer (legacy monitor)
 │   │
 │   └── database/
-│       ├── db.py            # Database operations
+│       ├── db.py            # SQLite database operations
 │       └── schema.sql       # Database schema
+│
+├── app/web/                 # Web dashboard (Flask, read-only)
+│   ├── server.py            # Routes + SQLite reads (`/`, `/api/comments`, `/api/status`)
+│   ├── templates/index.html # Facebook-like page
+│   └── static/              # style.css + app.js (polling, filters, sort)
+│
+├── tools/                   # One-off diagnostics (run from repo root)
+│   ├── README.md            # How to run these scripts
+│   ├── debug/               # check_*, debug_*, analyze_*, find_*, verify_*, measure_*
+│   ├── probe/               # probe_* live DOM probes
+│   ├── inspect/             # inspect_* DOM inspectors
+│   └── manual/              # post_*, reply_to_latest, test_* live scripts (not pytest)
+│
+├── docs/
+│   └── archive/             # Historical design docs (build, refactor, optimization reports)
 │
 ├── session/
 │   └── fb_session.json      # Saved Facebook session (created on first login)
@@ -189,11 +258,20 @@ fbcommentviewrt/
 ├── logs/
 │   └── app.log              # Application logs
 │
+├── run.py                   # Canonical runner (optimized, supports --post-test)
+├── run_optimized.py         # Legacy alias runner (still works)
+├── run_web.py               # Web dashboard runner (http://127.0.0.1:5000)
+├── run_web.bat              # Windows shortcut for the web dashboard
 ├── config.yaml              # User configuration
 ├── config.yaml.example      # Configuration template
 ├── requirements.txt         # Python dependencies
-└── README.md                # This file
+├── README.md                # This file
+├── AUTO_REPLY_GUIDE.md      # Auto-reply user guide (Thai)
+└── CHANGELOG.md             # Version history
 ```
+
+> Historical docs (BUILD, QUICKSTART variants, OPTIMIZATION_REPORT,
+> REFACTOR_COMPLETE, etc.) live in `docs/archive/` for reference.
 
 ## Architecture
 
@@ -299,7 +377,7 @@ pip install -r requirements.txt
 Delete `session/fb_session.json` and login again:
 ```bash
 del session\fb_session.json
-python -m app.main
+python run.py
 ```
 
 ### No comments detected

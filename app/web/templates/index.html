@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="th">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FB Comment Viewer</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+<header class="navbar">
+  <div class="nav-left">
+    <div class="fb-logo">f</div>
+    <input id="search" class="nav-search" type="search" placeholder="ค้นหาความคิดเห็น / ชื่อ...">
+  </div>
+  <div class="nav-title">FB Comment Viewer <span class="pill">อ่านอย่างเดียว</span></div>
+  <div class="nav-right"><span id="live-dot" class="live-dot"></span><span id="live-text">กำลังเชื่อมต่อ...</span></div>
+</header>
+
+<div class="layout">
+  <aside class="sidebar left">
+    <div class="side-card">
+      <h3>โพสต์ที่ติดตาม</h3>
+      <div class="add-post">
+        <input id="new-post-url" type="url" placeholder="วางลิงก์โพสต์ FB...">
+        <button id="add-post-btn">เพิ่ม</button>
+      </div>
+      <div id="add-post-msg" class="form-msg" hidden></div>
+      <div id="post-list" class="post-list"></div>
+    </div>
+    <div class="side-card">
+      <h3>ตัวกรอง</h3>
+      <label class="check"><input type="checkbox" id="owner-only"> เฉพาะเจ้าของโพสต์</label>
+      <label class="check"><input type="checkbox" id="unreplied-only"> เฉพาะที่ยังไม่ตอบ</label>
+      <label class="check"><input type="checkbox" id="new-only"> เฉพาะมาใหม่ (รอบนี้)</label>
+    </div>
+  </aside>
+
+  <main class="feed">
+    <div id="dberr" class="dberr" hidden></div>
+    <section class="card post-card">
+      <div class="post-head">
+        <div class="avatar big" id="post-avatar">ก</div>
+        <div>
+          <div class="post-group" id="post-group">กลุ่ม Facebook</div>
+          <div class="post-time muted"><span id="post-author">—</span> · <span id="post-time">—</span> · 🌐</div>
+        </div>
+        <a id="post-link" class="open-post" href="#" target="_blank" rel="noopener">เปิดโพสต์จริง ↗</a>
+      </div>
+      <div class="post-content" id="post-content">กำลังโหลดข้อมูลโพสต์...</div>
+      <div class="counts muted"><span id="count-comments">💬 0 ความคิดเห็น</span></div>
+      <div class="action-bar">
+        <button disabled>👍 ถูกใจ</button>
+        <button disabled>💬 แสดงความคิดเห็น</button>
+        <button disabled>↗ แชร์</button>
+      </div>
+      <div class="comment-tools">
+        <div class="sort-row">
+          <label>เรียงตาม:
+            <select id="sort">
+              <option value="newest">ใหม่ล่าสุด</option>
+              <option value="oldest">เก่าสุดก่อน</option>
+            </select>
+          </label>
+          <span class="muted" id="updated-at"></span>
+        </div>
+        <div class="poll-row">
+          <label>อัปเดตทุก <input id="poll-ms" type="number" min="500" max="60000" step="500" value="2000"> ms</label>
+          <button id="refresh-now">รีเฟรชตอนนี้ ⟳</button>
+        </div>
+        <div class="composer">
+          <div class="avatar">ค</div>
+          <input disabled placeholder="เขียนความคิดเห็น... (โหมดอ่านอย่างเดียว)">
+        </div>
+      </div>
+      <div id="comments" class="comments"></div>
+      <div id="empty" class="empty" hidden>ยังไม่มีความคิดเห็นที่ตรงตัวกรอง</div>
+    </section>
+  </main>
+
+  <aside class="sidebar right">
+    <div class="side-card">
+      <h3>สถานะ</h3>
+      <div class="stat"><span>ความคิดเห็นทั้งหมด</span><b id="st-total">–</b></div>
+      <div class="stat"><span>คอมเมนต์หลัก (T1)</span><b id="st-t1">–</b></div>
+      <div class="stat"><span>การตอบกลับ</span><b id="st-replies">–</b></div>
+      <div class="stat"><span>ของเจ้าของโพสต์</span><b id="st-owner">–</b></div>
+      <div class="stat"><span>ตอบกลับแล้ว</span><b id="st-replied">–</b></div>
+      <div class="stat"><span>อัปเดตล่าสุด</span><b id="st-updated">–</b></div>
+    </div>
+    <div class="side-card">
+      <h3>Auto-reply</h3>
+      <div class="stat"><span>สถานะ</span><b id="ar-status">–</b></div>
+      <div class="reply-msg" id="ar-msg"></div>
+    </div>
+    <div class="side-card">
+      <h3>บันทึก</h3>
+      <div id="log-list" class="log-list"><div class="log-item"><time>--:--:--</time>เริ่มติดตาม</div></div>
+    </div>
+    <div class="side-card">
+      <h3>สถานะโปรแกรม</h3>
+      <div class="stat"><span>มอนิเตอร์</span><b id="pg-monitor">–</b></div>
+      <div class="stat"><span>เบราว์เซอร์</span><b id="pg-headless">–</b></div>
+      <div class="stat"><span>เว็บ</span><b id="pg-web">–</b></div>
+      <div class="stat"><span>Session</span><b id="pg-session">–</b></div>
+      <div class="stat"><span>DB แถว</span><b id="pg-dbrows">–</b></div>
+      <div class="monlog" id="mon-log"><div class="muted">กำลังโหลด log...</div></div>
+    </div>
+  </aside>
+</div>
+
+<script>
+window.__INITIAL__ = {{ initial | safe }};
+window.__POST_URL__ = {{ post_url | tojson }};
+window.__SORT__ = {{ sort | tojson }};
+</script>
+<script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

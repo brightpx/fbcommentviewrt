@@ -164,3 +164,26 @@ class TestCommentDatabase:
         
         # Should be able to close without error
         assert True
+    
+    @pytest.mark.asyncio
+    async def test_upsert_scanned_preserves_replied_flag(self, temp_dir, sample_comment):
+        """Scan upserts must not clobber display_order (replied marker)."""
+        db_path = temp_dir / "test.db"
+        db = CommentDatabase(str(db_path))
+        await db.initialize()
+        
+        post_url = "https://facebook.com/groups/test/posts/123"
+        sample_comment.display_order = 1  # marked as replied by the bot
+        await db.save_comment(sample_comment, post_url)
+        
+        # Rescan sees the same comment with fresh text and display_order=0
+        sample_comment.message = "edited text"
+        sample_comment.display_order = 0
+        await db.upsert_scanned([sample_comment], post_url)
+        
+        comments = await db.get_comments(post_url)
+        assert len(comments) == 1
+        assert comments[0].message == "edited text"
+        assert comments[0].display_order == 1  # replied flag preserved
+        
+        await db.close()

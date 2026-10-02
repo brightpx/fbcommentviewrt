@@ -10,4 +10,4 @@ if "%~1"=="" (
     exit /b 1
 )
 
-python post_comment.py %*
+python tools/manual/post_comment.py %*

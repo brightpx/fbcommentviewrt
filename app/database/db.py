@@ -150,6 +150,47 @@ class CommentDatabase:
         await self.conn.commit()
         logger.debug(f"Saved {len(comments)} comments to database")
     
+    async def upsert_scanned(self, comments: List[Comment], post_url: str) -> None:
+        """Persist a DOM scan snapshot without clobbering reply state.
+
+        Unlike save_comments_batch, an upsert here must NOT touch
+        display_order (it doubles as the bot's "replied" marker) -
+        otherwise every scan would un-mark already-replied comments.
+        Only author/message freshness, last_seen and is_deleted are updated.
+        """
+        if not comments:
+            return
+        data = [
+            (
+                comment.id,
+                comment.parent_id,
+                comment.tier,
+                comment.author,
+                comment.message,
+                comment.created_time,
+                comment.last_seen,
+                comment.display_order,
+                comment.is_deleted,
+                post_url
+            )
+            for comment in comments
+        ]
+        await self.conn.executemany(
+            """
+            INSERT INTO comments
+            (id, parent_id, tier, author, message, created_time, last_seen, display_order, is_deleted, post_url)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                author = excluded.author,
+                message = excluded.message,
+                last_seen = excluded.last_seen,
+                is_deleted = 0
+            """,
+            data
+        )
+        await self.conn.commit()
+        logger.debug(f"Upserted {len(comments)} scanned comments for {post_url}")
+    
     async def get_comments(self, post_url: str, limit: int = 0) -> List[Comment]:
         """Get all comments for a post."""
         query = """
@@ -191,7 +232,23 @@ class CommentDatabase:
         )
         rows = await cursor.fetchall()
         return {row['id'] for row in rows}
-    
+
+    async def get_unreplied_owner_comment_ids(self, post_url: str, owner_name: str) -> set:
+        """IDs of owner comments on a post the bot never replied to.
+
+        ``display_order`` doubles as the "reply sent" marker (0 = not replied),
+        so these are exactly the rows a freshly-attached monitor still owes a
+        reply for.
+        """
+        cursor = await self.conn.execute(
+            "SELECT id FROM comments "
+            "WHERE post_url = ? AND is_deleted = 0 AND display_order = 0 "
+            "AND author IS NOT NULL AND LOWER(author) LIKE ?",
+            (post_url, f"{owner_name[:10].lower()}%")
+        )
+        rows = await cursor.fetchall()
+        return {row['id'] for row in rows}
+
     async def save_post_info(self, post_info: PostInfo) -> None:
         """Save or update post information."""
         now = datetime.now()
